@@ -97,7 +97,7 @@ pub fn maxLength(self: *const Individual) usize {
 pub fn forward(
     self: *const Individual,
     per_thread_buffer: *PerThreadBuffer,
-) void {
+) []const i8 {
     const activationPFN = activation_pfns[self.activation_pfn_index];
     for (self.layers) |*layer| {
         const input = per_thread_buffer.activations[0..layer.cols];
@@ -108,4 +108,6 @@ pub fn forward(
 
         requantize(out, per_thread_buffer.activations[0..layer.rows]);
     }
+
+    return per_thread_buffer.activations[0..self.layers[self.layers.len - 1].rows];
 }

@@ -96,7 +96,7 @@ pub const BitLinear = struct {
         std.debug.assert(inputs.len == k);
         std.debug.assert(out_buf.len == m);
 
-        var row = 0;
+        var row: usize = 0;
         while (row + 2 <= self.rows) : (row += 2) {
             const values = packedDot2(k, self.weights, row, inputs);
             inline for (0..2) |r| {
