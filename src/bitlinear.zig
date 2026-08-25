@@ -79,6 +79,8 @@ pub const BitLinear = struct {
 
     pub fn deinit(self: *BitLinear, allocator: std.mem.Allocator) void {
         allocator.free(self.weights);
+
+        self.* = undefined;
     }
 
     pub fn accumulate(self: *const BitLinear, inputs: []const i8, out_buf: []i32) void {
@@ -110,8 +112,8 @@ pub const BitLinear = struct {
         }
     }
 
-    pub fn requantize(input: []const i32, output: []i8) void {
-        std.debug.assert(input.len == output.len);
+    pub fn requantize(input: []const i32, out_buf: []i8) void {
+        std.debug.assert(input.len == out_buf.len);
 
         var max_abs: i64 = 0;
         for (input) |value| {
@@ -121,12 +123,12 @@ pub const BitLinear = struct {
         }
 
         if (max_abs == 0) {
-            @memset(output, 0);
+            @memset(out_buf, 0);
             // return 1.0;
             return;
         }
 
-        for (input, output) |value, *out| {
+        for (input, out_buf) |value, *out| {
             const num = @as(i64, value) * 127;
             const half = @divTrunc(max_abs, 2);
 

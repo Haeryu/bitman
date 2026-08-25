@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const activation_pfns = [_]*const fn ([]i32) void{ relu, leakyRelu };
+
 pub fn relu(values: []i32) void {
     const vec_len = std.simd.suggestVectorLength(i32).?;
     const Vec = @Vector(vec_len, i32);
@@ -17,7 +19,7 @@ pub fn relu(values: []i32) void {
     }
 }
 
-fn leakyRelu(values: []i32) void {
+pub fn leakyRelu(values: []i32) void {
     const vec_len = std.simd.suggestVectorLength(i32).?;
     const Vec = @Vector(vec_len, i32);
 
