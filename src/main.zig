@@ -4,7 +4,7 @@ const bitman = @import("bitman");
 const Individual = bitman.Individual;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    const gpa = init.gpa;
 
     var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const random = prng.random();
@@ -20,11 +20,11 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    var individual: Individual = try .init(allocator, random, &layer_settings);
-    defer individual.deinit(allocator);
+    var individual: Individual = try .init(gpa, random, &layer_settings);
+    defer individual.deinit(gpa);
 
-    var buffer: Individual.PerThreadBuffer = try .init(allocator, individual.maxLength());
-    defer buffer.deinit(allocator);
+    var buffer: Individual.PerThreadBuffer = try .init(gpa, individual.maxLength());
+    defer buffer.deinit(gpa);
 
     var input: [128]i8 = undefined;
     @memset(&input, 1);
