@@ -23,7 +23,7 @@ const prefill_col_micro = 4;
 const decode_row_tasks = 4;
 
 const ternary_bytes = blk: {
-    var table: [81]u8 = undefined;
+    var table: [3 * 3 * 3 * 3]u8 = undefined;
     var i: usize = 0;
 
     for (0..3) |a| {
@@ -49,8 +49,98 @@ pub const BitLinear = struct {
     rows: usize,
     cols: usize,
 
-    // reserved
-    weights_gain: f32 = undefined,
+    weights_gain: f32 = 1.0,
+
+    pub fn initRandom(
+        allocator: std.mem.Allocator,
+        random: std.Random,
+        rows: usize,
+        cols: usize,
+    ) !BitLinear {
+        std.debug.assert(rows != 0);
+        std.debug.assert(cols != 0);
+
+        const blocks_per_row = (cols + weights_per_block - 1) / weights_per_block;
+        const weights = try allocator.alloc(PackedBlock, rows * blocks_per_row);
+
+        for (weights) |*block| {
+            for (block) |*pak| {
+                pak.* = ternary_bytes[random.uintLessThan(usize, ternary_bytes.len)];
+            }
+        }
+
+        return .{
+            .weights = weights,
+            .rows = rows,
+            .cols = cols,
+            .weights_gain = 1.0,
+        };
+    }
+
+    pub fn deinit(self: *BitLinear, allocator: std.mem.Allocator) void {
+        allocator.free(self.weights);
+    }
+
+    pub fn accumulate(self: *const BitLinear, inputs: []const i8, out_buf: []i32) void {
+        std.debug.assert(inputs.len == self.cols);
+        std.debug.assert(out_buf.len == self.rows);
+
+        const m = self.rows;
+        const k = self.cols;
+
+        const blocks_per_row = (k + weights_per_block - 1) / weights_per_block;
+
+        std.debug.assert(self.weights.len == m * blocks_per_row);
+        std.debug.assert(inputs.len == k);
+        std.debug.assert(out_buf.len == m);
+
+        var row = 0;
+        while (row + 2 <= self.rows) : (row += 2) {
+            const values = packedDot2(k, self.weights, row, inputs);
+            inline for (0..2) |r| {
+                out_buf[row + r] = values[r];
+            }
+        }
+
+        while (row < self.rows) : (row += 1) {
+            const w_base = row * blocks_per_row;
+            const w_row = self.weights[w_base..][0..blocks_per_row];
+
+            out_buf[row] = packedDot(k, w_row, inputs);
+        }
+    }
+
+    pub fn requantize(input: []const i32, output: []i8) void {
+        std.debug.assert(input.len == output.len);
+
+        var max_abs: i64 = 0;
+        for (input) |value| {
+            const wide: i64 = value;
+            const magnitude = if (wide < 0) -wide else wide;
+            max_abs = @max(max_abs, magnitude);
+        }
+
+        if (max_abs == 0) {
+            @memset(output, 0);
+            // return 1.0;
+            return;
+        }
+
+        for (input, output) |value, *out| {
+            const num = @as(i64, value) * 127;
+            const half = @divTrunc(max_abs, 2);
+
+            const q = if (num >= 0)
+                @divTrunc(num + half, max_abs)
+            else
+                @divTrunc(num - half, max_abs);
+
+            out.* = @intCast(std.math.clamp(q, -127, 127));
+        }
+
+        // const requant_gain = @as(f32, @floatFromInt(max_abs)) / 127.0;
+        // return requant_gain;
+    }
 
     inline fn unpackGroup(pack: PackedBlock, comptime group: usize) ActivationVector {
         comptime std.debug.assert(group < packed_groups);
@@ -241,66 +331,5 @@ pub const BitLinear = struct {
         }
 
         return sum;
-    }
-
-    pub fn accumulate(self: *const BitLinear, inputs: []const i8, out_buf: []i32) void {
-        std.debug.assert(inputs.len == self.cols);
-        std.debug.assert(out_buf.len == self.rows);
-
-        const m = self.rows;
-        const k = self.cols;
-
-        const blocks_per_row = (k + weights_per_block - 1) / weights_per_block;
-
-        std.debug.assert(self.weights.len == m * blocks_per_row);
-        std.debug.assert(inputs.len == k);
-        std.debug.assert(out_buf.len == m);
-
-        var row = 0;
-        while (row + 2 <= self.rows) : (row += 2) {
-            const values = packedDot2(k, self.weights, row, inputs);
-            inline for (0..2) |r| {
-                out_buf[row + r] = values[r];
-            }
-        }
-
-        while (row < self.rows) : (row += 1) {
-            const w_base = row * blocks_per_row;
-            const w_row = self.weights[w_base..][0..blocks_per_row];
-
-            out_buf[row] = packedDot(k, w_row, inputs);
-        }
-    }
-
-    pub fn requantize(input: []const i32, output: []i8) void {
-        std.debug.assert(input.len == output.len);
-
-        var max_abs: i64 = 0;
-        for (input) |value| {
-            const wide: i64 = value;
-            const magnitude = if (wide < 0) -wide else wide;
-            max_abs = @max(max_abs, magnitude);
-        }
-
-        if (max_abs == 0) {
-            @memset(output, 0);
-            // return 1.0;
-            return;
-        }
-
-        for (input, output) |value, *out| {
-            const num = @as(i64, value) * 127;
-            const half = @divTrunc(max_abs, 2);
-
-            const q = if (num >= 0)
-                @divTrunc(num + half, max_abs)
-            else
-                @divTrunc(num - half, max_abs);
-
-            out.* = @intCast(std.math.clamp(q, -127, 127));
-        }
-
-        // const requant_gain = @as(f32, @floatFromInt(max_abs)) / 127.0;
-        // return requant_gain;
     }
 };
