@@ -55,6 +55,7 @@ pub const InitMethods = enum {
 layers: []Bitlinear,
 activation_pfn_index: usize,
 out: []i8,
+out_gain: f32,
 fitness: u64,
 
 pub fn init(
@@ -104,6 +105,7 @@ pub fn init(
         .layers = layers,
         .activation_pfn_index = activation_pfn_index,
         .out = out,
+        .out_gain = 1.0,
         .fitness = 0,
     };
 }
@@ -139,10 +141,20 @@ pub fn maxElementsLen(self: *const Individual) usize {
     return max;
 }
 
-pub fn forward(self: *Individual, inputs: []const i8, per_thread_buffer: *PerThreadBuffer) f32 {
+pub fn forward(
+    self: *Individual,
+    inputs: []const i8,
+    input_gain: f32,
+    per_thread_buffer: *PerThreadBuffer,
+) f32 {
+    std.debug.assert(self.layers.len != 0);
+    std.debug.assert(inputs.len == self.layers[0].cols);
+    std.debug.assert(std.math.isFinite(input_gain));
+    std.debug.assert(input_gain > 0.0);
+
     per_thread_buffer.loadInput(inputs);
     const activationPFN = activation_pfns[self.activation_pfn_index];
-    var activation_gain: f32 = 1.0;
+    var scale = input_gain;
     for (self.layers) |*layer| {
         const input = per_thread_buffer.activations[0..layer.cols];
         const out = per_thread_buffer.outs[0..layer.rows];
@@ -150,12 +162,16 @@ pub fn forward(self: *Individual, inputs: []const i8, per_thread_buffer: *PerThr
         layer.accumulate(input, out);
         activationPFN(out);
 
-        layer.activation_gain = requantize(out, per_thread_buffer.activations[0..layer.rows]);
+        const requant_gain = requantize(
+            out,
+            per_thread_buffer.activations[0..layer.rows],
+        );
 
-        activation_gain *= layer.weights_gain * layer.activation_gain;
+        scale *= layer.weights_gain * requant_gain;
     }
 
     @memcpy(self.out, per_thread_buffer.activations[0..self.layers[self.layers.len - 1].rows]);
+    self.out_gain = scale;
 
-    return activation_gain;
+    return scale;
 }

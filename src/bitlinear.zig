@@ -52,7 +52,6 @@ pub const BitLinear = struct {
     cols: usize,
 
     weights_gain: f32,
-    activation_gain: f32,
 
     pub fn initUndefined(
         allocator: std.mem.Allocator,
@@ -78,7 +77,6 @@ pub const BitLinear = struct {
             .rows = rows,
             .cols = cols,
             .weights_gain = 1.0,
-            .activation_gain = 1.0,
         };
     }
 

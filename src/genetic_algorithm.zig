@@ -1,6 +1,5 @@
 const std = @import("std");
 const Individual = @import("Individual.zig");
-const BitLinear = @import("bitlinear.zig").BitLinear;
 const PackedVector = @import("bitlinear.zig").PackedVector;
 const activation_vec_len = @import("bitlinear.zig").activation_vec_len;
 const packed_groups = @import("bitlinear.zig").packed_groups;
@@ -115,8 +114,11 @@ fn uniformCrossover(
             }
         }
 
-        const eps: f32 = 1e-5;
-        const child_gain = @max(BitLinear.absMean(f32, floats), eps);
+        const fallback_gain = if (random.boolean())
+            p0.weights_gain
+        else
+            p1.weights_gain;
+        const child_gain = projectedGain(floats, fallback_gain);
 
         child.quantizeFromGain(floats, child_gain);
 
@@ -133,6 +135,29 @@ fn uniformCrossover(
         parent0.activation_pfn_index
     else
         parent1.activation_pfn_index;
+}
+
+fn projectedGain(values: []const f32, fallback_gain: f32) f32 {
+    std.debug.assert(std.math.isFinite(fallback_gain));
+    std.debug.assert(fallback_gain > 0.0);
+
+    var abs_sum: f64 = 0.0;
+    var nonzero_count: usize = 0;
+
+    for (values) |value| {
+        if (value != 0.0) {
+            abs_sum += @abs(@as(f64, value));
+            nonzero_count += 1;
+        }
+    }
+
+    if (nonzero_count == 0) {
+        return fallback_gain;
+    }
+
+    return @floatCast(
+        abs_sum / @as(f64, @floatFromInt(nonzero_count)),
+    );
 }
 
 fn gaussianMutation(

@@ -460,6 +460,7 @@ const generation_length = 2500;
 
 const eye_cells = 9;
 const input_count = eye_cells;
+const vision_gain: f32 = 1.0 / 127.0;
 
 const pi: f32 = std.math.pi;
 const tau: f32 = 2.0 * pi;
@@ -692,14 +693,16 @@ const Simulation = struct {
                 &self.foods,
             );
 
-            _ = brain.forward(
+            const output_gain = brain.forward(
                 &vision,
+                vision_gain,
                 &self.buffer,
             );
 
             applyBrain(
                 animal,
                 brain.out,
+                output_gain,
             );
         }
     }
@@ -845,13 +848,14 @@ const Simulation = struct {
             if (brain.out.len >= 2) {
                 const out0 = brain.out[0];
                 const out1 = brain.out[1];
+                const control0 = outputControl(out0, brain.out_gain);
+                const control1 = outputControl(out1, brain.out_gain);
 
-                result.output0_mean += @as(f64, @floatFromInt(out0));
-                result.output1_mean += @as(f64, @floatFromInt(out1));
+                result.output0_mean += @as(f64, @floatCast(control0));
+                result.output1_mean += @as(f64, @floatCast(control1));
 
-                // Both ends map to near-full control: 0 -> -1, 127 -> +1.
-                if (out0 <= 7 or out0 >= 120) result.output0_edge_count += 1;
-                if (out1 <= 7 or out1 >= 120) result.output1_edge_count += 1;
+                if (@abs(control0) >= 0.9) result.output0_edge_count += 1;
+                if (@abs(control1) >= 0.9) result.output1_edge_count += 1;
             }
         }
 
@@ -1074,11 +1078,12 @@ fn makeVision(
 fn applyBrain(
     animal: *Animal,
     output: []const i8,
+    output_gain: f32,
 ) void {
     std.debug.assert(output.len >= 2);
 
-    const speed_control = outputControl(output[0]);
-    const turn_control = outputControl(output[1]);
+    const speed_control = outputControl(output[0], output_gain);
+    const turn_control = outputControl(output[1], output_gain);
 
     animal.speed = std.math.clamp(
         animal.speed +
@@ -1093,24 +1098,14 @@ fn applyBrain(
     );
 }
 
-// ReLU output is quantized to roughly 0..127.
-// Map it to the relative command range -1..+1.
-//
-//   0   -> -1
-//   64  -> ~0
-//   127 -> +1
-fn outputControl(value: i8) f32 {
-    const positive: i16 = std.math.clamp(
-        @as(i16, value),
-        0,
-        127,
-    );
+fn outputControl(value: i8, output_gain: f32) f32 {
+    std.debug.assert(std.math.isFinite(output_gain));
+    std.debug.assert(output_gain > 0.0);
 
-    const unit =
-        @as(f32, @floatFromInt(positive)) /
-        127.0;
+    const real_output =
+        @as(f32, @floatFromInt(value)) * output_gain;
 
-    return unit * 2.0 - 1.0;
+    return std.math.clamp(real_output, 0.0, 2.0) - 1.0;
 }
 
 fn moveAnimal(animal: *Animal) u8 {
