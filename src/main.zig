@@ -39,11 +39,10 @@ pub fn main(init: std.process.Init) !void {
     var input: [128]i8 = undefined;
     @memset(&input, 1);
 
-    buffer.loadInput(&input);
-
-    indi0.forward(&buffer);
+    indi0.forward(&input, &buffer);
     indi0.fitness = 10;
-    indi1.forward(&buffer);
+
+    indi1.forward(&input, &buffer);
     indi1.fitness = 20;
 
     bitman.genetic_algorithm.evolve(
@@ -53,12 +52,11 @@ pub fn main(init: std.process.Init) !void {
         &buffer,
         .roulette_wheel,
         .uniform_crossover,
-        .{ .gaussian_mutation = .{ .chance = 0.1, .coeff = 0.2 } },
+        .{ .gaussian_mutation = .{ .chance = 0.1, .coeff = 1.0 } },
     );
 
-    buffer.loadInput(&input);
-    childs[0].forward(&buffer);
-    childs[1].forward(&buffer);
+    childs[0].forward(&input, &buffer);
+    childs[1].forward(&input, &buffer);
 
     std.debug.print("weights = {any}\n", .{indi0.layers[0].weights});
     std.debug.print("weights = {any}\n", .{indi1.layers[0].weights});

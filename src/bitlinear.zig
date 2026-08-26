@@ -187,6 +187,7 @@ pub const BitLinear = struct {
         std.debug.assert(input.len == self.rows * self.cols);
 
         const eps: f32 = 1e-5;
+        const gain = @max(self.weights_gain, eps);
         const w_scale = 1.0 / @max(absMean(f32, input), eps);
         const blocks_per_row = (self.cols + weights_per_block - 1) / weights_per_block;
 
@@ -200,7 +201,7 @@ pub const BitLinear = struct {
             wQuant(f32, w_scale, input_row, output_row);
         }
 
-        self.weights_gain = 1.0 / w_scale;
+        self.weights_gain = gain;
     }
 
     fn wQuant(

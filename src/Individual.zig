@@ -127,7 +127,8 @@ pub fn maxElementsLen(self: *const Individual) usize {
     return max;
 }
 
-pub fn forward(self: *Individual, per_thread_buffer: *PerThreadBuffer) void {
+pub fn forward(self: *Individual, inputs: []const i8, per_thread_buffer: *PerThreadBuffer) void {
+    per_thread_buffer.loadInput(inputs);
     const activationPFN = activation_pfns[self.activation_pfn_index];
     for (self.layers) |*layer| {
         const input = per_thread_buffer.activations[0..layer.cols];
