@@ -490,8 +490,8 @@ const starvation_per_body_cell = 3;
 
 // 3 danger + 8 rays * 3 channels + 2 local food + hunger + length + constant.
 const input_count = 32;
-const hidden0 = 96;
-const hidden1 = 64;
+const hidden0 = 256;
+const hidden1 = 256;
 const output_count = 3;
 
 const input_gain: f32 = 1.0 / 127.0;
