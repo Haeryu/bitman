@@ -40,7 +40,8 @@ const Individual = bitman.Individual;
 //   2 normal
 //   3 fast
 //   4 turbo
-//   Q / Esc quit and print full history
+//   5 warp
+//   Q / Esc quit and print full history + graph
 // ============================================================================
 
 // ============================================================================
@@ -263,6 +264,7 @@ const SpeedMode = enum {
     normal,
     fast,
     turbo,
+    warp,
 
     fn ticksPerFrame(self: SpeedMode) usize {
         return switch (self) {
@@ -270,6 +272,7 @@ const SpeedMode = enum {
             .normal => 1,
             .fast => 32,
             .turbo => 512,
+            .warp => 4096,
         };
     }
 
@@ -279,6 +282,7 @@ const SpeedMode = enum {
             .normal => 25,
             .fast => 1,
             .turbo => 0,
+            .warp => 0,
         };
     }
 
@@ -288,6 +292,7 @@ const SpeedMode = enum {
             .normal => "normal",
             .fast => "fast",
             .turbo => "turbo",
+            .warp => "warp",
         };
     }
 };
@@ -451,6 +456,7 @@ const WinConsole = struct {
                     '2' => action.mode = .normal,
                     '3' => action.mode = .fast,
                     '4' => action.mode = .turbo,
+                    '5' => action.mode = .warp,
                     else => {},
                 }
             }
@@ -509,6 +515,10 @@ const board_clear_reward: u64 = 100000;
 
 const history_capacity = 30;
 const stats_capacity_initial = 128;
+
+const checkpoint_path = "bitman_snake.chk";
+const checkpoint_magic = "BMSNKCP1";
+const checkpoint_version: u64 = 1;
 
 const anchor_episode_seeds = [anchor_episode_count]u64{
     0x1111_2222_3333_4444,
@@ -1668,6 +1678,371 @@ fn copyGenome(
     @memset(dst.out, 0);
 }
 
+
+// ============================================================================
+// CHECKPOINT SAVE / LOAD
+// ============================================================================
+
+const CheckpointEncoder = struct {
+    buffer: []u8,
+    pos: usize = 0,
+
+    fn putBytes(self: *CheckpointEncoder, bytes: []const u8) void {
+        std.debug.assert(self.pos + bytes.len <= self.buffer.len);
+        @memcpy(self.buffer[self.pos..][0..bytes.len], bytes);
+        self.pos += bytes.len;
+    }
+
+    fn putU64(self: *CheckpointEncoder, value: u64) void {
+        std.debug.assert(self.pos + 8 <= self.buffer.len);
+        inline for (0..8) |i| {
+            self.buffer[self.pos + i] = @truncate(value >> (i * 8));
+        }
+        self.pos += 8;
+    }
+
+    fn putF32(self: *CheckpointEncoder, value: f32) void {
+        const bits: u32 = @bitCast(value);
+        self.putU64(@as(u64, bits));
+    }
+
+    fn putF64(self: *CheckpointEncoder, value: f64) void {
+        self.putU64(@bitCast(value));
+    }
+};
+
+const CheckpointDecoder = struct {
+    buffer: []const u8,
+    pos: usize = 0,
+
+    fn takeBytes(self: *CheckpointDecoder, out: []u8) !void {
+        if (self.pos + out.len > self.buffer.len) {
+            return error.TruncatedCheckpoint;
+        }
+        @memcpy(out, self.buffer[self.pos..][0..out.len]);
+        self.pos += out.len;
+    }
+
+    fn takeU64(self: *CheckpointDecoder) !u64 {
+        if (self.pos + 8 > self.buffer.len) {
+            return error.TruncatedCheckpoint;
+        }
+
+        var result: u64 = 0;
+        inline for (0..8) |i| {
+            result |= @as(u64, self.buffer[self.pos + i]) << (i * 8);
+        }
+        self.pos += 8;
+        return result;
+    }
+
+    fn takeF32(self: *CheckpointDecoder) !f32 {
+        const bits64 = try self.takeU64();
+        if (bits64 > std.math.maxInt(u32)) {
+            return error.BadCheckpoint;
+        }
+        const bits: u32 = @intCast(bits64);
+        return @bitCast(bits);
+    }
+
+    fn takeF64(self: *CheckpointDecoder) !f64 {
+        return @bitCast(try self.takeU64());
+    }
+};
+
+fn checkpointSize(sim: *const Simulation) usize {
+    // magic + version + 7 configuration values + generation + stats_len + PRNG state
+    var size: usize = checkpoint_magic.len + (14 * 8);
+
+    // GenerationStats is serialized as nine 64-bit words.
+    size += sim.stats_len * (9 * 8);
+
+    for (sim.parents) |brain| {
+        // activation function index + layer count
+        size += 2 * 8;
+
+        for (brain.layers) |layer| {
+            const weight_bytes = std.mem.sliceAsBytes(layer.weights);
+            const bias_bytes = std.mem.sliceAsBytes(layer.biases);
+
+            // rows, cols, weight byte count, gain bits, bias element count
+            size += 5 * 8;
+            size += weight_bytes.len;
+            size += bias_bytes.len;
+        }
+    }
+
+    return size;
+}
+
+fn saveCheckpoint(
+    sim: *const Simulation,
+    io: std.Io,
+    prng: *const std.Random.DefaultPrng,
+) !void {
+    const size = checkpointSize(sim);
+    const data = try sim.allocator.alloc(u8, size);
+    defer sim.allocator.free(data);
+
+    var enc = CheckpointEncoder{ .buffer = data };
+
+    enc.putBytes(checkpoint_magic);
+    enc.putU64(checkpoint_version);
+    enc.putU64(population_size);
+    enc.putU64(episode_count);
+    enc.putU64(input_count);
+    enc.putU64(hidden0);
+    enc.putU64(hidden1);
+    enc.putU64(output_count);
+    enc.putU64(elite_count);
+    enc.putU64(sim.generation);
+    enc.putU64(sim.stats_len);
+
+    for (prng.s) |state_word| {
+        enc.putU64(state_word);
+    }
+
+    for (sim.stats_log[0..sim.stats_len]) |stats| {
+        enc.putU64(stats.generation);
+        enc.putU64(stats.global_ticks);
+        enc.putU64(stats.best_fitness);
+        enc.putU64(stats.best_index);
+        enc.putF64(stats.average_fitness);
+        enc.putU64(stats.best_foods);
+        enc.putF64(stats.average_foods);
+        enc.putU64(stats.best_steps);
+        enc.putU64(stats.total_clears);
+    }
+
+    for (sim.parents) |brain| {
+        enc.putU64(brain.activation_pfn_index);
+        enc.putU64(brain.layers.len);
+
+        for (brain.layers) |layer| {
+            const weight_bytes = std.mem.sliceAsBytes(layer.weights);
+            const bias_bytes = std.mem.sliceAsBytes(layer.biases);
+
+            enc.putU64(layer.rows);
+            enc.putU64(layer.cols);
+            enc.putU64(weight_bytes.len);
+            enc.putF32(layer.weights_gain);
+            enc.putU64(layer.biases.len);
+            enc.putBytes(weight_bytes);
+            enc.putBytes(bias_bytes);
+        }
+    }
+
+    std.debug.assert(enc.pos == data.len);
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = checkpoint_path,
+        .data = data,
+    });
+}
+
+fn ensureStatsCapacity(sim: *Simulation, needed: usize) !void {
+    if (needed <= sim.stats_log.len) return;
+
+    var new_capacity = @max(sim.stats_log.len, 1);
+    while (new_capacity < needed) {
+        new_capacity *= 2;
+    }
+
+    sim.stats_log = try sim.allocator.realloc(
+        sim.stats_log,
+        new_capacity,
+    );
+}
+
+fn rebuildDerivedCheckpointState(sim: *Simulation) void {
+    sim.last_stats = .{};
+    sim.best_ever_fitness = 0;
+    sim.best_ever_foods = 0;
+    sim.history_len = 0;
+    sim.history = @splat(0.0);
+
+    for (sim.stats_log[0..sim.stats_len]) |stats| {
+        sim.last_stats = stats;
+        sim.best_ever_fitness = @max(
+            sim.best_ever_fitness,
+            stats.best_fitness,
+        );
+        sim.best_ever_foods = @max(
+            sim.best_ever_foods,
+            stats.best_foods,
+        );
+        sim.pushHistory(stats.average_foods);
+    }
+}
+
+fn loadCheckpoint(
+    sim: *Simulation,
+    io: std.Io,
+    prng: *std.Random.DefaultPrng,
+) !bool {
+    var file = std.Io.Dir.cwd().openFile(
+        io,
+        checkpoint_path,
+        .{},
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size == 0 or stat.size > std.math.maxInt(usize)) {
+        return error.BadCheckpoint;
+    }
+
+    const data = try sim.allocator.alloc(u8, @intCast(stat.size));
+    defer sim.allocator.free(data);
+
+    var reader = file.reader(io, &.{});
+    reader.interface.readSliceAll(data) catch |err| switch (err) {
+        error.EndOfStream => return error.TruncatedCheckpoint,
+        error.ReadFailed => return reader.err orelse error.BadCheckpoint,
+    };
+
+    var dec = CheckpointDecoder{ .buffer = data };
+
+    var magic: [checkpoint_magic.len]u8 = undefined;
+    try dec.takeBytes(&magic);
+    if (!std.mem.eql(u8, &magic, checkpoint_magic)) {
+        return error.BadCheckpointMagic;
+    }
+
+    if (try dec.takeU64() != checkpoint_version) {
+        return error.UnsupportedCheckpointVersion;
+    }
+    if (try dec.takeU64() != population_size or
+        try dec.takeU64() != episode_count or
+        try dec.takeU64() != input_count or
+        try dec.takeU64() != hidden0 or
+        try dec.takeU64() != hidden1 or
+        try dec.takeU64() != output_count or
+        try dec.takeU64() != elite_count)
+    {
+        return error.CheckpointConfigurationMismatch;
+    }
+
+    const saved_generation_u64 = try dec.takeU64();
+    const saved_stats_len_u64 = try dec.takeU64();
+    if (saved_generation_u64 > std.math.maxInt(usize) or
+        saved_stats_len_u64 > std.math.maxInt(usize))
+    {
+        return error.BadCheckpoint;
+    }
+
+    const saved_generation: usize = @intCast(saved_generation_u64);
+    const saved_stats_len: usize = @intCast(saved_stats_len_u64);
+
+    // A checkpoint always represents the boundary immediately before the
+    // generation named by `generation` starts.
+    if (saved_generation != saved_stats_len) {
+        return error.BadCheckpoint;
+    }
+
+    var saved_prng_state: [4]u64 = undefined;
+    for (&saved_prng_state) |*state_word| {
+        state_word.* = try dec.takeU64();
+    }
+
+    try ensureStatsCapacity(sim, saved_stats_len);
+
+    for (sim.stats_log[0..saved_stats_len]) |*stats| {
+        const generation_u64 = try dec.takeU64();
+        const global_ticks_u64 = try dec.takeU64();
+        const best_fitness = try dec.takeU64();
+        const best_index_u64 = try dec.takeU64();
+        const average_fitness = try dec.takeF64();
+        const best_foods = try dec.takeU64();
+        const average_foods = try dec.takeF64();
+        const best_steps = try dec.takeU64();
+        const total_clears = try dec.takeU64();
+
+        if (generation_u64 > std.math.maxInt(usize) or
+            global_ticks_u64 > std.math.maxInt(usize) or
+            best_index_u64 >= population_size or
+            !std.math.isFinite(average_fitness) or
+            !std.math.isFinite(average_foods))
+        {
+            return error.BadCheckpoint;
+        }
+
+        stats.* = .{
+            .generation = @intCast(generation_u64),
+            .global_ticks = @intCast(global_ticks_u64),
+            .best_fitness = best_fitness,
+            .best_index = @intCast(best_index_u64),
+            .average_fitness = average_fitness,
+            .best_foods = best_foods,
+            .average_foods = average_foods,
+            .best_steps = best_steps,
+            .total_clears = total_clears,
+        };
+    }
+
+    for (sim.parents) |*brain| {
+        const activation_index_u64 = try dec.takeU64();
+        const layer_count_u64 = try dec.takeU64();
+
+        if (activation_index_u64 != 1 or
+            layer_count_u64 != brain.layers.len)
+        {
+            return error.CheckpointConfigurationMismatch;
+        }
+
+        brain.activation_pfn_index = 1;
+
+        for (brain.layers) |*layer| {
+            const rows = try dec.takeU64();
+            const cols = try dec.takeU64();
+            const weight_bytes_len = try dec.takeU64();
+            const weights_gain = try dec.takeF32();
+            const bias_count = try dec.takeU64();
+
+            const weight_bytes = std.mem.sliceAsBytes(layer.weights);
+            const bias_bytes = std.mem.sliceAsBytes(layer.biases);
+
+            if (rows != layer.rows or
+                cols != layer.cols or
+                weight_bytes_len != weight_bytes.len or
+                bias_count != layer.biases.len or
+                !std.math.isFinite(weights_gain) or
+                weights_gain <= 0.0)
+            {
+                return error.CheckpointConfigurationMismatch;
+            }
+
+            try dec.takeBytes(weight_bytes);
+            try dec.takeBytes(bias_bytes);
+            layer.weights_gain = weights_gain;
+        }
+
+        brain.out_gain = 1.0;
+        brain.fitness = 0;
+        @memset(brain.out, 0);
+    }
+
+    if (dec.pos != data.len) {
+        return error.BadCheckpoint;
+    }
+
+    sim.generation = saved_generation;
+    sim.global_ticks = 0;
+    sim.stats_len = saved_stats_len;
+    rebuildDerivedCheckpointState(sim);
+
+    prng.s = saved_prng_state;
+
+    // Partial episodes are deliberately not persisted. Resume from the clean
+    // generation boundary represented by the saved parent population.
+    sim.resetAgents();
+
+    return true;
+}
+
 // ============================================================================
 // RENDERING
 // ============================================================================
@@ -1772,7 +2147,7 @@ fn render(
     frame.write(
         0,
         5,
-        "keys: [1] slow  [2] normal  [3] fast  [4] turbo  [Q/Esc] history + quit",
+        "keys: [1] slow  [2] normal  [3] fast  [4] turbo  [5] WARP  [Q/Esc] history + graph + quit",
         COLOR_YELLOW,
     );
 
@@ -2151,6 +2526,142 @@ fn drawHistory(
 }
 
 // ============================================================================
+// FULL EVOLUTION GRAPH
+// ============================================================================
+
+const final_graph_width = 100;
+const final_graph_height = 18;
+
+fn printFoodGraph(sim: *const Simulation) void {
+    if (sim.stats_len == 0) return;
+
+    const columns = @min(sim.stats_len, final_graph_width);
+    var avg_series: [final_graph_width]f64 = @splat(0.0);
+    var best_series: [final_graph_width]f64 = @splat(0.0);
+
+    for (0..columns) |column| {
+        const begin = column * sim.stats_len / columns;
+        var end = (column + 1) * sim.stats_len / columns;
+        if (end <= begin) end = begin + 1;
+
+        var avg_sum: f64 = 0.0;
+        var bucket_best: f64 = 0.0;
+
+        for (sim.stats_log[begin..end]) |stats| {
+            avg_sum += stats.average_foods;
+            bucket_best = @max(
+                bucket_best,
+                @as(f64, @floatFromInt(stats.best_foods)),
+            );
+        }
+
+        avg_series[column] =
+            avg_sum / @as(f64, @floatFromInt(end - begin));
+        best_series[column] = bucket_best;
+    }
+
+    var max_value: f64 = 1.0;
+    for (best_series[0..columns]) |value| {
+        max_value = @max(max_value, value);
+    }
+
+    std.debug.print(
+        "\n================ EVOLUTION CURVE: FOOD / GENOME ================\n",
+        .{},
+    );
+    std.debug.print(
+        "# best food   + average food   @ overlap   ({d} generations -> {d} columns)\n\n",
+        .{ sim.stats_len, columns },
+    );
+
+    for (0..final_graph_height) |row| {
+        const y_value =
+            max_value *
+            @as(f64, @floatFromInt(final_graph_height - 1 - row)) /
+            @as(f64, @floatFromInt(final_graph_height - 1));
+
+        if (row == 0 or row == final_graph_height / 2 or row + 1 == final_graph_height) {
+            std.debug.print("{d:>7.1} |", .{y_value});
+        } else {
+            std.debug.print("        |", .{});
+        }
+
+        for (0..columns) |column| {
+            const best_normalized = std.math.clamp(
+                best_series[column] / max_value,
+                0.0,
+                1.0,
+            );
+            const avg_normalized = std.math.clamp(
+                avg_series[column] / max_value,
+                0.0,
+                1.0,
+            );
+
+            const best_row =
+                final_graph_height - 1 -
+                @as(
+                    usize,
+                    @intFromFloat(@round(
+                        best_normalized *
+                            @as(f64, @floatFromInt(final_graph_height - 1)),
+                    )),
+                );
+            const avg_row =
+                final_graph_height - 1 -
+                @as(
+                    usize,
+                    @intFromFloat(@round(
+                        avg_normalized *
+                            @as(f64, @floatFromInt(final_graph_height - 1)),
+                    )),
+                );
+
+            const ch: u8 = if (row == best_row and row == avg_row)
+                '@'
+            else if (row == best_row)
+                '#'
+            else if (row == avg_row)
+                '+'
+            else
+                ' ';
+
+            std.debug.print("{c}", .{ch});
+        }
+
+        std.debug.print("\n", .{});
+    }
+
+    std.debug.print("        +", .{});
+    for (0..columns) |_| {
+        std.debug.print("-", .{});
+    }
+    std.debug.print("\n", .{});
+
+    const first_generation = sim.stats_log[0].generation;
+    const last_generation = sim.stats_log[sim.stats_len - 1].generation;
+    std.debug.print(
+        "         gen {d} -> {d}\n",
+        .{ first_generation, last_generation },
+    );
+
+    const first_avg = sim.stats_log[0].average_foods;
+    const last_avg = sim.stats_log[sim.stats_len - 1].average_foods;
+
+    if (first_avg > 0.0) {
+        std.debug.print(
+            "avg-food multiplier: x{d:.2}   ({d:.3} -> {d:.3})\n",
+            .{ last_avg / first_avg, first_avg, last_avg },
+        );
+    }
+
+    std.debug.print(
+        "=================================================================\n",
+        .{},
+    );
+}
+
+// ============================================================================
 // FINAL REPORT
 // ============================================================================
 
@@ -2259,6 +2770,8 @@ fn printFinalReport(sim: *const Simulation) void {
         "=================================================================\n",
         .{},
     );
+
+    printFoodGraph(sim);
 }
 
 // ============================================================================
@@ -2284,11 +2797,15 @@ pub fn main(
             mode = .fast;
         } else if (std.mem.eql(u8, arg, "--turbo")) {
             mode = .turbo;
+        } else if (std.mem.eql(u8, arg, "--warp")) {
+            mode = .warp;
         }
     }
 
+    const initial_prng_seed: u64 = 0x534e_414b_455f_4249;
+
     var prng: std.Random.DefaultPrng =
-        .init(0x534e_414b_455f_4249);
+        .init(initial_prng_seed);
 
     const random = prng.random();
 
@@ -2297,6 +2814,32 @@ pub fn main(
         random,
     );
     defer sim.deinit(allocator);
+
+    const checkpoint_loaded = loadCheckpoint(
+        &sim,
+        io,
+        &prng,
+    ) catch |err| blk: {
+        std.debug.print(
+            "[checkpoint] ignored {s}: {s}\n",
+            .{ checkpoint_path, @errorName(err) },
+        );
+
+        // loadCheckpoint may have already copied some bytes before discovering
+        // corruption. Rebuild a pristine simulation instead of continuing from
+        // a half-loaded population.
+        sim.deinit(allocator);
+        prng = .init(initial_prng_seed);
+        sim = try Simulation.init(allocator, random);
+        break :blk false;
+    };
+
+    if (checkpoint_loaded) {
+        std.debug.print(
+            "[checkpoint] loaded {s}: resume at generation {d}\n",
+            .{ checkpoint_path, sim.generation },
+        );
+    }
 
     var console = try WinConsole.init();
 
@@ -2321,6 +2864,12 @@ pub fn main(
         const action = console.pollInput();
 
         if (action.quit) {
+            saveCheckpoint(&sim, io, &prng) catch |err| {
+                std.debug.print(
+                    "\n[checkpoint] save failed: {s}\n",
+                    .{@errorName(err)},
+                );
+            };
             running = false;
             break;
         }
@@ -2330,7 +2879,17 @@ pub fn main(
         }
 
         for (0..mode.ticksPerFrame()) |_| {
-            _ = try sim.step(io, random);
+            if (try sim.step(io, random)) |_| {
+                // Save only after evolve() has swapped the new parent
+                // population in and advanced `generation`. This checkpoint is
+                // therefore a clean generation boundary.
+                saveCheckpoint(&sim, io, &prng) catch |err| {
+                    std.debug.print(
+                        "\n[checkpoint] save failed: {s}\n",
+                        .{@errorName(err)},
+                    );
+                };
+            }
         }
 
         render(
