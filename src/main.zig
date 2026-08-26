@@ -395,19 +395,35 @@ const WinConsole = struct {
 //   - brains survive through the genome only
 // ============================================================
 
-const population_size = 40;
+const population_size = 128;
 const food_count = 60;
 
-const generations = 120;
+const generations = 500;
 const generation_length = 2500;
+
+// The champion from each training generation is evaluated again on
+// the exact same fixed-seed worlds. These scores NEVER participate
+// in selection; they exist only to measure real progress with much
+// less generation-to-generation noise.
+const eval_world_count = 8;
+const eval_seeds = [_]u64{
+    0x4556_414c_0000_0001,
+    0x4556_414c_0000_0002,
+    0x4556_414c_0000_0003,
+    0x4556_414c_0000_0004,
+    0x4556_414c_0000_0005,
+    0x4556_414c_0000_0006,
+    0x4556_414c_0000_0007,
+    0x4556_414c_0000_0008,
+};
 
 // TUI.
 //
 // A watched generation renders only every N simulation ticks.
 // The simulation itself still runs every tick.
 const preview_every = 10;
-const preview_stride = 5;
-const preview_delay_ms = 10;
+const preview_stride = 10;
+const preview_delay_ms = 30;
 
 // Eye settings from Shorelark.
 const eye_cells = 9;
@@ -621,7 +637,11 @@ pub fn main(
 
     var average_history: [generations]f64 = @splat(0.0);
     var best_history: [generations]usize = @splat(0);
+    var eval_history: [generations]f64 = @splat(0.0);
     var history_len: usize = 0;
+
+    var last_eval_score: f64 = 0.0;
+    var best_eval_ever: f64 = 0.0;
 
     for (0..generations) |generation| {
         resetCreatures(
@@ -652,6 +672,7 @@ pub fn main(
             watch,
             &average_history,
             &best_history,
+            &eval_history,
             history_len,
         );
 
@@ -661,11 +682,22 @@ pub fn main(
                 &creatures,
             );
 
+        // Re-evaluate only the TRAINING champion on fixed worlds.
+        // This is intentionally disconnected from fitness/selection.
+        const eval_score =
+            evaluateChampion(
+                &parents[stats.best_index],
+                &buffer,
+            );
+
         average_history[generation] = stats.average_eaten;
         best_history[generation] = stats.best_eaten;
+        eval_history[generation] = eval_score;
         history_len = generation + 1;
 
         last_stats = stats;
+        last_eval_score = eval_score;
+        best_eval_ever = @max(best_eval_ever, eval_score);
 
         best_ever =
             @max(
@@ -686,6 +718,7 @@ pub fn main(
             best_ever,
             &average_history,
             &best_history,
+            &eval_history,
             history_len,
         );
 
@@ -757,6 +790,7 @@ pub fn main(
     printLearningCurve(
         &average_history,
         &best_history,
+        &eval_history,
         history_len,
     );
 
@@ -771,6 +805,9 @@ pub fn main(
         \\last best eaten   : {d}
         \\last avg eaten    : {d:.3}
         \\best ever eaten   : {d}
+        \\eval worlds       : {d} fixed seeds
+        \\last eval champ   : {d:.3}
+        \\best eval champ   : {d:.3}
         \\mutation          : {d:.2}% / coeff {d:.2}
         \\===================================================
         \\
@@ -783,6 +820,9 @@ pub fn main(
             last_stats.best_eaten,
             last_stats.average_eaten,
             best_ever,
+            eval_world_count,
+            last_eval_score,
+            best_eval_ever,
             mutation_chance * 100.0,
             mutation_coeff,
         },
@@ -953,6 +993,7 @@ fn runGeneration(
     watch: bool,
     average_history: *const [generations]f64,
     best_history: *const [generations]usize,
+    eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
     for (0..generation_length) |tick| {
@@ -981,6 +1022,7 @@ fn runGeneration(
                 best_ever,
                 average_history,
                 best_history,
+                eval_history,
                 history_len,
             );
 
@@ -992,6 +1034,83 @@ fn runGeneration(
             ) catch {};
         }
     }
+}
+
+// ============================================================
+// FIXED-SEED CHAMPION EVALUATION
+// ============================================================
+//
+// The selected training champion is replayed on the same eight
+// deterministic worlds every generation.  Its average score is a
+// measurement only: it never changes fitness and never participates
+// in parent selection.
+//
+// A seed determines the initial creature state, initial food field,
+// and deterministic food-respawn random stream for that evaluation.
+// ============================================================
+
+fn evaluateChampion(
+    champion: *Individual,
+    buffer: *Individual.PerThreadBuffer,
+) f64 {
+    var total_eaten: usize = 0;
+
+    for (eval_seeds) |seed| {
+        var eval_prng: std.Random.DefaultPrng =
+            .init(seed);
+
+        const random =
+            eval_prng.random();
+
+        var creature = Creature{
+            .pos = randomPosition(random),
+            .rotation = random.float(f32) * tau,
+            .speed = speed_initial,
+            .eaten = 0,
+        };
+
+        var foods: [food_count]Food =
+            undefined;
+
+        resetFoods(
+            random,
+            &foods,
+        );
+
+        for (0..generation_length) |_| {
+            const vision =
+                senseAndEat(
+                    random,
+                    &creature,
+                    &foods,
+                );
+
+            _ = champion.forward(
+                &vision,
+                buffer,
+            );
+
+            applyBrain(
+                &creature,
+                champion.out,
+            );
+
+            moveCreature(
+                &creature,
+            );
+        }
+
+        total_eaten +=
+            creature.eaten;
+    }
+
+    return @as(
+        f64,
+        @floatFromInt(total_eaten),
+    ) / @as(
+        f64,
+        @floatFromInt(eval_world_count),
+    );
 }
 
 // ============================================================
@@ -1616,6 +1735,7 @@ fn renderTui(
     best_ever: usize,
     average_history: *const [generations]f64,
     best_history: *const [generations]usize,
+    eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
     var frame =
@@ -2042,6 +2162,7 @@ fn renderTui(
         attr,
         average_history,
         best_history,
+        eval_history,
         history_len,
     );
 
@@ -2171,26 +2292,38 @@ fn drawLearningCurve(
     attr: WORD,
     average_history: *const [generations]f64,
     best_history: *const [generations]usize,
+    eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
     const graph_width = 24;
     const graph_height = 8;
 
     frame.write(x, y, "LEARNING CURVE", attr);
-    frame.write(x, y + 1, "# best  . average", attr);
+    frame.write(x, y + 1, "@eval #best .avg", attr);
 
     if (history_len == 0) {
         frame.write(x, y + 3, "waiting for gen 0...", attr);
         return;
     }
 
-    var max_best: usize = 1;
+    var max_value: f64 = 1.0;
+
     for (best_history.*[0..history_len]) |value| {
-        max_best = @max(max_best, value);
+        max_value = @max(
+            max_value,
+            @as(f64, @floatFromInt(value)),
+        );
     }
 
-    const max_value = @as(f64, @floatFromInt(max_best));
-    const used_width = @min(graph_width, history_len);
+    for (eval_history.*[0..history_len]) |value| {
+        max_value = @max(max_value, value);
+    }
+
+    const max_label: usize =
+        @intFromFloat(@ceil(max_value));
+
+    const used_width =
+        @min(graph_width, history_len);
 
     for (0..used_width) |column| {
         const history_index = if (used_width == 1)
@@ -2209,11 +2342,35 @@ fn drawLearningCurve(
             1.0,
         );
 
-        const avg_height: usize = @intFromFloat(@round(
-            avg_normalized * @as(f64, @floatFromInt(graph_height - 1)),
-        ));
+        const best_normalized = std.math.clamp(
+            @as(
+                f64,
+                @floatFromInt(best_history.*[history_index]),
+            ) / max_value,
+            0.0,
+            1.0,
+        );
 
-        const avg_row = graph_height - 1 - @min(avg_height, graph_height - 1);
+        const eval_normalized = std.math.clamp(
+            eval_history.*[history_index] / max_value,
+            0.0,
+            1.0,
+        );
+
+        const avg_row = curveRow(
+            avg_normalized,
+            graph_height,
+        );
+
+        const best_row = curveRow(
+            best_normalized,
+            graph_height,
+        );
+
+        const eval_row = curveRow(
+            eval_normalized,
+            graph_height,
+        );
 
         frame.put(
             x + screen_x,
@@ -2222,27 +2379,19 @@ fn drawLearningCurve(
             attr,
         );
 
-        const best_value = @as(
-            f64,
-            @floatFromInt(best_history.*[history_index]),
-        );
-
-        const best_normalized = std.math.clamp(
-            best_value / max_value,
-            0.0,
-            1.0,
-        );
-
-        const best_height: usize = @intFromFloat(@round(
-            best_normalized * @as(f64, @floatFromInt(graph_height - 1)),
-        ));
-
-        const best_row = graph_height - 1 - @min(best_height, graph_height - 1);
-
         frame.put(
             x + screen_x,
             y + 2 + best_row,
             '#',
+            attr,
+        );
+
+        // Draw eval last so the low-noise measurement remains visible
+        // if it happens to overlap a training curve.
+        frame.put(
+            x + screen_x,
+            y + 2 + eval_row,
+            '@',
             attr,
         );
     }
@@ -2252,13 +2401,34 @@ fn drawLearningCurve(
         y + 10,
         attr,
         "max {d} gen 0..{d}",
-        .{ max_best, history_len - 1 },
+        .{ max_label, history_len - 1 },
     );
+}
+
+fn curveRow(
+    normalized: f64,
+    comptime graph_height: usize,
+) usize {
+    const height: usize =
+        @intFromFloat(
+            @round(
+                normalized *
+                    @as(
+                        f64,
+                        @floatFromInt(graph_height - 1),
+                    ),
+            ),
+        );
+
+    return graph_height -
+        1 -
+        @min(height, graph_height - 1);
 }
 
 fn printLearningCurve(
     average_history: *const [generations]f64,
     best_history: *const [generations]usize,
+    eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
     const graph_width = 60;
@@ -2268,13 +2438,24 @@ fn printLearningCurve(
         return;
     }
 
-    var max_best: usize = 1;
+    var max_value: f64 = 1.0;
+
     for (best_history.*[0..history_len]) |value| {
-        max_best = @max(max_best, value);
+        max_value = @max(
+            max_value,
+            @as(f64, @floatFromInt(value)),
+        );
     }
 
-    var graph: [graph_height][graph_width]u8 = @splat(@splat(' '));
-    const max_value = @as(f64, @floatFromInt(max_best));
+    for (eval_history.*[0..history_len]) |value| {
+        max_value = @max(max_value, value);
+    }
+
+    const max_label: usize =
+        @intFromFloat(@ceil(max_value));
+
+    var graph: [graph_height][graph_width]u8 =
+        @splat(@splat(' '));
 
     for (0..graph_width) |column| {
         const index = if (graph_width == 1)
@@ -2289,35 +2470,64 @@ fn printLearningCurve(
         );
 
         const best = std.math.clamp(
-            @as(f64, @floatFromInt(best_history.*[index])) / max_value,
+            @as(
+                f64,
+                @floatFromInt(best_history.*[index]),
+            ) / max_value,
             0.0,
             1.0,
         );
 
-        const avg_height: usize = @intFromFloat(@round(
-            avg * @as(f64, @floatFromInt(graph_height - 1)),
-        ));
+        const eval_score = std.math.clamp(
+            eval_history.*[index] / max_value,
+            0.0,
+            1.0,
+        );
 
-        const best_height: usize = @intFromFloat(@round(
-            best * @as(f64, @floatFromInt(graph_height - 1)),
-        ));
+        const avg_row = curveRow(
+            avg,
+            graph_height,
+        );
 
-        const avg_row = graph_height - 1 - @min(avg_height, graph_height - 1);
-        const best_row = graph_height - 1 - @min(best_height, graph_height - 1);
+        const best_row = curveRow(
+            best,
+            graph_height,
+        );
+
+        const eval_row = curveRow(
+            eval_score,
+            graph_height,
+        );
 
         graph[avg_row][column] = '.';
         graph[best_row][column] = '#';
+
+        // Evaluation is the most useful curve, so keep it visible on
+        // collisions with training curves.
+        graph[eval_row][column] = '@';
     }
 
-    std.debug.print("\nLEARNING CURVE   # best   . average\n", .{});
+    std.debug.print(
+        "\nLEARNING CURVE   @ fixed-seed eval   # train best   . train average\n",
+        .{},
+    );
 
     for (graph, 0..) |row, row_index| {
         if (row_index == 0) {
-            std.debug.print("{d:>4} |{s}|\n", .{ max_best, row[0..] });
+            std.debug.print(
+                "{d:>4} |{s}|\n",
+                .{ max_label, row[0..] },
+            );
         } else if (row_index == graph_height - 1) {
-            std.debug.print("{d:>4} |{s}|\n", .{ 0, row[0..] });
+            std.debug.print(
+                "{d:>4} |{s}|\n",
+                .{ 0, row[0..] },
+            );
         } else {
-            std.debug.print("     |{s}|\n", .{row[0..]});
+            std.debug.print(
+                "     |{s}|\n",
+                .{row[0..]},
+            );
         }
     }
 
