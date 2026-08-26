@@ -2,6 +2,7 @@ const std = @import("std");
 const Individual = @import("Individual.zig");
 const PackedVector = @import("bitlinear.zig").PackedVector;
 const activation_vec_len = @import("bitlinear.zig").activation_vec_len;
+const packed_groups = @import("bitlinear.zig").packed_groups;
 const PerThreadBuffer = Individual.PerThreadBuffer;
 
 pub const SelectionMethod = enum {
@@ -97,27 +98,40 @@ fn uniformCrossover(
     parent1: *const Individual,
     out_child: *Individual,
 ) void {
-    var p0_wv: PackedVector = undefined;
-    var p1_wv: PackedVector = undefined;
+    std.debug.assert(parent0.layers.len == parent1.layers.len);
+    std.debug.assert(parent0.layers.len == out_child.layers.len);
+
     const RandomInt = @Int(.unsigned, activation_vec_len);
-    var random_int: RandomInt = undefined;
-    var packed_bool: @Vector(activation_vec_len, bool) = undefined;
+
+    const BoolVector = @Vector(activation_vec_len, bool);
 
     for (parent0.layers, parent1.layers, out_child.layers) |*p0_l, *p1_l, *oc_l| {
+        std.debug.assert(p0_l.weights.len == p1_l.weights.len);
+        std.debug.assert(p0_l.weights.len == oc_l.weights.len);
+
         for (p0_l.weights, p1_l.weights, oc_l.weights) |p0_w, p1_w, *oc_w| {
-            p0_wv = @bitCast(p0_w);
-            p1_wv = @bitCast(p1_w);
+            const p0: PackedVector = @bitCast(p0_w);
+            const p1: PackedVector = @bitCast(p1_w);
 
-            random_int = random.int(RandomInt);
-            packed_bool = @bitCast(random_int);
+            var result: PackedVector = @splat(0);
 
-            oc_w.* = @bitCast(@select(u8, packed_bool, p0_wv, p1_wv));
+            inline for (0..packed_groups) |group| {
+                const choices: BoolVector = @bitCast(random.int(RandomInt));
+
+                const shift: u3 = @intCast(group * 2);
+
+                const mask: PackedVector = @splat(@as(u8, 0b11) << shift);
+
+                const p0_gene = p0 & mask;
+                const p1_gene = p1 & mask;
+
+                result |= @select(u8, choices, p0_gene, p1_gene);
+            }
+
+            oc_w.* = @bitCast(result);
         }
 
-        oc_l.weights_gain = if (random.boolean())
-            p0_l.weights_gain
-        else
-            p1_l.weights_gain;
+        oc_l.weights_gain = (p0_l.weights_gain + p1_l.weights_gain) * 0.5;
     }
 
     out_child.activation_pfn_index = if (random.boolean())

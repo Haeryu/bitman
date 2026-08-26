@@ -26,11 +26,12 @@ pub fn main(init: std.process.Init) !void {
     var indi1: Individual = try .init(gpa, random, &layer_settings, .random);
     defer indi1.deinit(gpa);
 
-    var child0: Individual = try .init(gpa, random, &layer_settings, .empty);
-    defer child0.deinit(gpa);
-
-    var child1: Individual = try .init(gpa, random, &layer_settings, .empty);
-    defer child1.deinit(gpa);
+    var childs = [_]Individual{
+        try .init(gpa, random, &layer_settings, .empty),
+        try .init(gpa, random, &layer_settings, .empty),
+    };
+    defer childs[0].deinit(gpa);
+    defer childs[1].deinit(gpa);
 
     var buffer: Individual.PerThreadBuffer = try .init(gpa, indi0.maxRowColLen(), indi0.maxElementsLen());
     defer buffer.deinit(gpa);
@@ -45,8 +46,6 @@ pub fn main(init: std.process.Init) !void {
     indi1.forward(&buffer);
     indi1.fitness = 20;
 
-    var childs = [_]Individual{ child0, child1 };
-
     bitman.genetic_algorithm.evolve(
         random,
         &.{ indi0, indi1 },
@@ -57,16 +56,17 @@ pub fn main(init: std.process.Init) !void {
         .{ .gaussian_mutation = .{ .chance = 0.1, .coeff = 0.2 } },
     );
 
-    child0.forward(&buffer);
-    child1.forward(&buffer);
+    buffer.loadInput(&input);
+    childs[0].forward(&buffer);
+    childs[1].forward(&buffer);
 
     std.debug.print("weights = {any}\n", .{indi0.layers[0].weights});
     std.debug.print("weights = {any}\n", .{indi1.layers[0].weights});
-    std.debug.print("weights = {any}\n", .{child0.layers[0].weights});
-    std.debug.print("weights = {any}\n", .{child1.layers[0].weights});
+    std.debug.print("weights = {any}\n", .{childs[0].layers[0].weights});
+    std.debug.print("weights = {any}\n", .{childs[1].layers[0].weights});
 
     std.debug.print("output = {any}\n", .{indi0.out});
     std.debug.print("output = {any}\n", .{indi1.out});
-    std.debug.print("output = {any}\n", .{child0.out});
-    std.debug.print("output = {any}\n", .{child1.out});
+    std.debug.print("output = {any}\n", .{childs[0].out});
+    std.debug.print("output = {any}\n", .{childs[1].out});
 }

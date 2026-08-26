@@ -9,7 +9,7 @@ const ActivationVector = @Vector(activation_vec_len, i8);
 const WideVector = @Vector(wide_vec_len, i16);
 const AccumVector = @Vector(accum_vec_len, i32);
 
-const packed_groups = 4;
+pub const packed_groups = 4;
 const weights_per_block = packed_groups * activation_vec_len;
 
 pub const PackedBlock = [activation_vec_len]u8;
@@ -187,11 +187,55 @@ pub const BitLinear = struct {
         std.debug.assert(input.len == self.rows * self.cols);
 
         const eps: f32 = 1e-5;
+        const w_scale = 1.0 / @max(absMean(f32, input), eps);
+        const blocks_per_row = (self.cols + weights_per_block - 1) / weights_per_block;
 
-        const gain = @max(absMean(f32, input), eps);
-        const inv_gain = 1.0 / gain;
+        std.debug.assert(self.weights.len == self.rows * blocks_per_row);
 
-        self.weights_gain = inv_gain;
+        for (0..self.rows) |row| {
+            const input_row = input[row * self.cols ..][0..self.cols];
+
+            const output_row = self.weights[row * blocks_per_row ..][0..blocks_per_row];
+
+            wQuant(f32, w_scale, input_row, output_row);
+        }
+
+        self.weights_gain = 1.0 / w_scale;
+    }
+
+    fn wQuant(
+        comptime T: type,
+        w_scale: T,
+        input: []const T,
+        output_buf: []PackedBlock,
+    ) void {
+        const block_count = (input.len + weights_per_block - 1) / weights_per_block;
+
+        std.debug.assert(output_buf.len == block_count);
+
+        for (0..block_count) |block_index| {
+            var block: PackedBlock = @splat(0);
+            const input_base = block_index * weights_per_block;
+
+            const count = @min(weights_per_block, input.len - input_base);
+            for (0..count) |index| {
+                const value = input[input_base + index];
+                const quantized = std.math.clamp(@round(value * w_scale), -1, 1);
+                const ternary: i8 = @intFromFloat(quantized);
+
+                // {-1, 0, +1} -> {0, 1, 2}
+                const code: u2 = @intCast(ternary + 1);
+                const group = index / activation_vec_len;
+
+                const lane = index % activation_vec_len;
+
+                const shift: u3 = @intCast(group * 2);
+
+                block[lane] |= @as(u8, code) << shift;
+            }
+
+            output_buf[block_index] = block;
+        }
     }
 
     fn Vector(comptime T: type) type {
