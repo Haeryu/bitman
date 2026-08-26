@@ -968,6 +968,7 @@ fn allocPopulation(
             random,
             layer_settings,
             init_method,
+            true,
         );
         initialized += 1;
     }

@@ -62,6 +62,7 @@ pub fn init(
     random: std.Random,
     layer_settings: []const LayerSetting,
     comptime init_method: InitMethods,
+    comptime make_bias: bool,
 ) !Individual {
     for (layer_settings[0 .. layer_settings.len - 1], 0..) |setting, i| {
         std.debug.assert(setting.rows == layer_settings[i + 1].cols);
@@ -78,8 +79,19 @@ pub fn init(
 
     for (layer_settings, layers) |layer_setting, *layer| {
         layer.* = switch (comptime init_method) {
-            .random => try .initRandom(allocator, random, layer_setting.rows, layer_setting.cols),
-            .empty => try .initUndefined(allocator, layer_setting.rows, layer_setting.cols),
+            .random => try .initRandom(
+                allocator,
+                random,
+                layer_setting.rows,
+                layer_setting.cols,
+                make_bias,
+            ),
+            .empty => try .initUndefined(
+                allocator,
+                layer_setting.rows,
+                layer_setting.cols,
+                make_bias,
+            ),
         };
         layers_init_count += 1;
     }

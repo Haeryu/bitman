@@ -46,60 +46,75 @@ const ternary_bytes = blk: {
 
 pub const BitLinear = struct {
     weights: []PackedBlock,
+    biases: []i32,
+
     rows: usize,
     cols: usize,
 
     weights_gain: f32,
     activation_gain: f32,
 
+    pub fn initUndefined(
+        allocator: std.mem.Allocator,
+        rows: usize,
+        cols: usize,
+        comptime make_bias: bool,
+    ) !BitLinear {
+        std.debug.assert(rows != 0);
+        std.debug.assert(cols != 0);
+
+        const blocks_per_row = (cols + weights_per_block - 1) / weights_per_block;
+        const weights = try allocator.alloc(PackedBlock, rows * blocks_per_row);
+        errdefer allocator.free(weights);
+
+        const biases = if (make_bias) try allocator.alloc(i32, rows) else &.{};
+        errdefer if (make_bias) {
+            allocator.free(biases);
+        };
+
+        return .{
+            .weights = weights,
+            .biases = biases,
+            .rows = rows,
+            .cols = cols,
+            .weights_gain = 1.0,
+            .activation_gain = 1.0,
+        };
+    }
+
     pub fn initRandom(
         allocator: std.mem.Allocator,
         random: std.Random,
         rows: usize,
         cols: usize,
+        comptime make_bias: bool,
     ) !BitLinear {
         std.debug.assert(rows != 0);
         std.debug.assert(cols != 0);
 
-        const blocks_per_row = (cols + weights_per_block - 1) / weights_per_block;
-        const weights = try allocator.alloc(PackedBlock, rows * blocks_per_row);
+        var self: BitLinear = try .initUndefined(allocator, rows, cols, make_bias);
+        errdefer self.deinit(allocator);
 
-        for (weights) |*block| {
+        for (self.weights) |*block| {
             for (block) |*pak| {
                 pak.* = ternary_bytes[random.uintLessThan(usize, ternary_bytes.len)];
             }
         }
 
-        return .{
-            .weights = weights,
-            .rows = rows,
-            .cols = cols,
-            .weights_gain = 1.0,
-            .activation_gain = 1.0,
-        };
-    }
+        if (make_bias) {
+            for (self.biases) |*bias| {
+                bias.* = random.intRangeAtMost(i32, -127, 127);
+            }
+        }
 
-    pub fn initUndefined(
-        allocator: std.mem.Allocator,
-        rows: usize,
-        cols: usize,
-    ) !BitLinear {
-        std.debug.assert(rows != 0);
-        std.debug.assert(cols != 0);
-
-        const blocks_per_row = (cols + weights_per_block - 1) / weights_per_block;
-        const weights = try allocator.alloc(PackedBlock, rows * blocks_per_row);
-
-        return .{
-            .weights = weights,
-            .rows = rows,
-            .cols = cols,
-            .weights_gain = 1.0,
-            .activation_gain = 1.0,
-        };
+        return self;
     }
 
     pub fn deinit(self: *BitLinear, allocator: std.mem.Allocator) void {
+        if (self.biases.len != 0) {
+            allocator.free(self.biases);
+        }
+
         allocator.free(self.weights);
 
         self.* = undefined;
@@ -122,7 +137,11 @@ pub const BitLinear = struct {
         while (row + 2 <= self.rows) : (row += 2) {
             const values = packedDot2(k, self.weights, row, inputs);
             inline for (0..2) |r| {
-                out_buf[row + r] = values[r];
+                if (self.biases.len != 0) {
+                    out_buf[row + r] = values[r] + self.biases[row + r];
+                } else {
+                    out_buf[row + r] = values[r];
+                }
             }
         }
 
@@ -130,7 +149,11 @@ pub const BitLinear = struct {
             const w_base = row * blocks_per_row;
             const w_row = self.weights[w_base..][0..blocks_per_row];
 
-            out_buf[row] = packedDot(k, w_row, inputs);
+            if (self.biases.len != 0) {
+                out_buf[row] = packedDot(k, w_row, inputs) + self.biases[row];
+            } else {
+                out_buf[row] = packedDot(k, w_row, inputs);
+            }
         }
     }
 

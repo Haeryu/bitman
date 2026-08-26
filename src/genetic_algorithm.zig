@@ -119,6 +119,14 @@ fn uniformCrossover(
         const child_gain = @max(BitLinear.absMean(f32, floats), eps);
 
         child.quantizeFromGain(floats, child_gain);
+
+        // bias len == 0 skip
+        for (child.biases, 0..) |*bias, row| {
+            bias.* = if (random.boolean())
+                p0.biases[row]
+            else
+                p1.biases[row];
+        }
     }
 
     out_child.activation_pfn_index = if (random.boolean())
@@ -148,5 +156,21 @@ fn gaussianMutation(
         }
 
         layer.quantizeFrom(buf);
+
+        for (layer.biases) |*bias| { // len 0 skip
+            if (random.float(f32) < chance) {
+                const sign: i32 = if (random.boolean()) -1 else 1;
+
+                const magnitude: i32 = @intFromFloat(coeff * 127.0 * random.float(f32));
+
+                const limit: i32 = @intCast(layer.cols * 127);
+
+                bias.* = std.math.clamp(
+                    bias.* + sign * magnitude,
+                    -limit,
+                    limit,
+                );
+            }
+        }
     }
 }
