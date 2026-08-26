@@ -234,6 +234,30 @@ pub const BitLinear = struct {
         return packedWeightAt(block, index);
     }
 
+    pub fn wScale(
+        comptime T: type,
+        w: []const T,
+        eps: T,
+    ) T {
+        return scale(T, 1, -1, w, eps, absMean);
+    }
+
+    fn scale(
+        comptime T: type,
+        comptime Q_max: T,
+        comptime Q_min: T,
+        input: []const T,
+        eps: T,
+        comptime measure: @TypeOf(absMean),
+    ) T {
+        std.debug.assert(input.len != 0);
+        std.debug.assert(eps > 0);
+
+        const Q_b = @max(@abs(Q_max), @abs(Q_min));
+        const abs_max = measure(T, input);
+        return Q_b / @max(abs_max, eps);
+    }
+
     fn wQuant(
         comptime T: type,
         w_scale: T,

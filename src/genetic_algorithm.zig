@@ -1,5 +1,6 @@
 const std = @import("std");
 const Individual = @import("Individual.zig");
+const BitLinear = @import("bitlinear.zig").BitLinear;
 const PackedVector = @import("bitlinear.zig").PackedVector;
 const activation_vec_len = @import("bitlinear.zig").activation_vec_len;
 const packed_groups = @import("bitlinear.zig").packed_groups;
@@ -121,10 +122,9 @@ fn uniformCrossover(
             }
         }
 
-        const child_gain: f32 = if (nonzero_count != 0)
-            @floatCast(abs_sum / @as(f64, @floatFromInt(nonzero_count)))
-        else
-            (p0.weights_gain + p1.weights_gain) * 0.5;
+        const child_w_scale = BitLinear.wScale(f32, floats, 1e-5);
+
+        const child_gain = 1.0 / child_w_scale;
 
         child.quantizeFromGain(floats, child_gain);
     }
