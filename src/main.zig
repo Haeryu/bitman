@@ -4,25 +4,43 @@ const bitman = @import("bitman");
 const Individual = bitman.Individual;
 
 // ============================================================================
-// BITMAN x SHORELARK (pt4) - Win32 console experiment
+// BITMAN SNAKE
 //
-// Based on the simulation described in:
-//   https://pwy.io/posts/learning-to-fly-pt4/
+// One-file evolutionary Snake experiment for Haeryu/bitman.
 //
-// This file intentionally keeps everything in one place.
-// Bitman provides the quantized neural network + genetic algorithm.
-// Everything else (world, eye, physics, rendering) lives here.
+// Genome evaluation:
+//   - 96 genomes
+//   - 8 shared episodes per generation: 3 anchors + 5 rotating seeds
+//   - 32 -> 64 -> 32 -> 3 ternary network
+//   - outputs: TURN LEFT / GO STRAIGHT / TURN RIGHT
+//   - top 6 genomes are copied unchanged (elitism)
+//   - remaining children use roulette + uniform crossover + mutation
+//
+// Sensors (32 i8 inputs):
+//   - immediate danger: straight / left / right
+//   - 8 body-relative rays x (wall proximity, body proximity, food visibility)
+//   - food vector in the snake's local forward/right frame
+//   - hunger, length, and an explicit +1 constant
+//
+// Fitness:
+//   +1       every non-collision step
+//   +20      per NEW best distance unit toward the current food
+//   +6000    when food is eaten
+//   +400*N   food-chain bonus for the Nth food in an episode
+//   +100000  if the board is completely filled
+//
+// The progress reward is monotonic per food: moving away and coming back can
+// no longer farm shaping reward. Rotating episode seeds also make memorizing a
+// tiny fixed training set much less useful.
+//
+// Episodes terminate on wall/body collision, starvation, or tick limit.
 //
 // Controls:
-//   1  slow
-//   2  normal
-//   3  fast
-//   4  turbo
-//   Q / Esc  print full generation history, then quit
-//
-// World note:
-//   The original Shorelark wraps at the edges. This experiment bounces from
-//   walls instead, so a bird does not teleport to the opposite side.
+//   1 slow
+//   2 normal
+//   3 fast
+//   4 turbo
+//   Q / Esc quit and print full history
 // ============================================================================
 
 // ============================================================================
@@ -176,7 +194,7 @@ extern "kernel32" fn CloseHandle(
 ) callconv(.winapi) BOOL;
 
 const render_width = 128;
-const render_height = 42;
+const render_height = 43;
 
 const Frame = struct {
     cells: [render_width * render_height]CHAR_INFO,
@@ -250,15 +268,15 @@ const SpeedMode = enum {
         return switch (self) {
             .slow => 1,
             .normal => 1,
-            .fast => 16,
-            .turbo => 128,
+            .fast => 32,
+            .turbo => 512,
         };
     }
 
     fn delayMs(self: SpeedMode) i64 {
         return switch (self) {
-            .slow => 50,
-            .normal => 16,
+            .slow => 80,
+            .normal => 25,
             .fast => 1,
             .turbo => 0,
         };
@@ -451,124 +469,487 @@ const WinConsole = struct {
 };
 
 // ============================================================================
-// SHORELARK-LIKE WORLD
+// SNAKE WORLD
 // ============================================================================
 
-const population_size = 40;
-const food_count = 60;
-const generation_length = 2500;
+const board_width = 28;
+const board_height = 18;
+const board_cells = board_width * board_height;
 
-const eye_cells = 9;
-const input_count = eye_cells;
-const vision_gain: f32 = 1.0 / 127.0;
+const population_size = 128;
+const elite_count = 8;
+const episode_count = 8;
+const anchor_episode_count = 3;
 
-const pi: f32 = std.math.pi;
-const tau: f32 = 2.0 * pi;
+// There is deliberately no global episode tick limit. A productive snake may
+// run until it collides or fills the board. The only anti-infinite-loop guard
+// is "hunger", and that budget grows with body length so late-game routing is
+// not killed by the old fixed 200-step cap.
+const starvation_base = 200;
+const starvation_per_body_cell = 3;
 
-const fov_range: f32 = 0.25;
-const fov_angle: f32 = pi + pi / 4.0;
+// 3 danger + 8 rays * 3 channels + 2 local food + hunger + length + constant.
+const input_count = 32;
+const hidden0 = 96;
+const hidden1 = 64;
+const output_count = 3;
 
-const collision_radius: f32 = 0.01;
+const input_gain: f32 = 1.0 / 127.0;
 
-const speed_min: f32 = 0.001;
-const speed_max: f32 = 0.005;
-const speed_initial: f32 = 0.002;
-
-// Bitman returns quantized i8 activations, so these are deliberately much
-// smaller than the raw f32 constants in the article.
-const speed_accel: f32 = 0.00025;
-const rotation_accel: f32 = pi / 16.0;
-
-// Bitman's ternary weights need a mutation large enough to cross a
-// requantization boundary.
-const mutation_chance: f32 = 0.01;
+// ~9.4k ternary weights. 0.25% keeps the expected number of directly
+// mutated weights near the old smaller network (~24 per child).
+const mutation_chance: f32 = 0.0025;
 const mutation_coeff: f32 = 1.0;
 
-const grid_width = 88;
-const grid_height = 30;
+const food_reward: u64 = 6000;
+const food_chain_reward: u64 = 400;
+const progress_reward: u64 = 20;
+const survival_reward: u64 = 1;
+const board_clear_reward: u64 = 100000;
 
-const history_capacity = 28;
-const initial_generation_log_capacity = 128;
+const history_capacity = 30;
+const stats_capacity_initial = 128;
 
-const Vec2 = struct {
-    x: f32,
-    y: f32,
+const anchor_episode_seeds = [anchor_episode_count]u64{
+    0x1111_2222_3333_4444,
+    0x94d0_49bb_1331_11eb,
+    0x6a09_e667_f3bc_c909,
 };
 
-const Food = struct {
-    pos: Vec2,
+const Pos = struct {
+    x: i16,
+    y: i16,
+
+    fn eql(a: Pos, b: Pos) bool {
+        return a.x == b.x and a.y == b.y;
+    }
 };
 
-const Animal = struct {
-    pos: Vec2,
+const Direction = enum(u2) {
+    up,
+    righ,
+    down,
+    lef,
 
-    // 0 = up, PI/2 = right.
-    rotation: f32,
-    speed: f32,
+    fn left(self: Direction) Direction {
+        return switch (self) {
+            .up => .lef,
+            .lef => .down,
+            .down => .righ,
+            .righ => .up,
+        };
+    }
 
-    satiation: u64,
+    fn right(self: Direction) Direction {
+        return switch (self) {
+            .up => .righ,
+            .righ => .down,
+            .down => .lef,
+            .lef => .up,
+        };
+    }
+
+    fn delta(self: Direction) Pos {
+        return switch (self) {
+            .up => .{ .x = 0, .y = -1 },
+            .righ => .{ .x = 1, .y = 0 },
+            .down => .{ .x = 0, .y = 1 },
+            .lef => .{ .x = -1, .y = 0 },
+        };
+    }
+
+    fn name(self: Direction) []const u8 {
+        return switch (self) {
+            .up => "up",
+            .righ => "right",
+            .down => "down",
+            .lef => "left",
+        };
+    }
+};
+
+const RelativeAction = enum(u2) {
+    left,
+    straight,
+    right,
+
+    fn name(self: RelativeAction) []const u8 {
+        return switch (self) {
+            .left => "LEFT",
+            .straight => "STRAIGHT",
+            .right => "RIGHT",
+        };
+    }
+};
+
+const GameStatus = enum {
+    active,
+    collision,
+    starved,
+    cleared,
+
+    fn name(self: GameStatus) []const u8 {
+        return switch (self) {
+            .active => "active",
+            .collision => "collision",
+            .starved => "starved",
+            .cleared => "cleared",
+        };
+    }
+};
+
+const StepEvents = struct {
+    ate_food: bool = false,
+    progress_units: u16 = 0,
+    cleared: bool = false,
+};
+
+const SnakeGame = struct {
+    snake: [board_cells]Pos,
+    length: usize,
+    direction: Direction,
+    food: Pos,
+
+    ticks: usize,
+    steps_since_food: usize,
+    foods: u64,
+
+    rng_state: u64,
+    closest_food_distance: i32,
+    status: GameStatus,
+
+    fn init(seed: u64) SnakeGame {
+        var game = SnakeGame{
+            .snake = undefined,
+            .length = 3,
+            .direction = @enumFromInt(@as(u2, @truncate(seed >> 8))),
+            .food = undefined,
+            .ticks = 0,
+            .steps_since_food = 0,
+            .foods = 0,
+            .rng_state = if (seed == 0) 0x9e37_79b9_7f4a_7c15 else seed,
+            .closest_food_distance = std.math.maxInt(i32),
+            .status = .active,
+        };
+
+        // Randomize the whole legal start region, not just a tiny center patch.
+        // The bounds account for the two body cells behind the head.
+        const min_x: i16 = if (game.direction == .righ) 2 else 0;
+        const max_x: i16 = if (game.direction == .lef)
+            @intCast(board_width - 3)
+        else
+            @intCast(board_width - 1);
+        const min_y: i16 = if (game.direction == .down) 2 else 0;
+        const max_y: i16 = if (game.direction == .up)
+            @intCast(board_height - 3)
+        else
+            @intCast(board_height - 1);
+
+        const span_x: u64 = @intCast(max_x - min_x + 1);
+        const span_y: u64 = @intCast(max_y - min_y + 1);
+
+        const h = Pos{
+            .x = min_x + @as(i16, @intCast((seed >> 16) % span_x)),
+            .y = min_y + @as(i16, @intCast((seed >> 32) % span_y)),
+        };
+
+        game.snake[0] = h;
+
+        const back = game.direction.delta();
+        game.snake[1] = .{
+            .x = h.x - back.x,
+            .y = h.y - back.y,
+        };
+        game.snake[2] = .{
+            .x = h.x - back.x * 2,
+            .y = h.y - back.y * 2,
+        };
+
+        game.spawnFood();
+
+        return game;
+    }
+
+    fn head(self: *const SnakeGame) Pos {
+        return self.snake[0];
+    }
+
+    fn step(
+        self: *SnakeGame,
+        action: RelativeAction,
+    ) StepEvents {
+        if (self.status != .active) return .{};
+
+        var events = StepEvents{};
+
+        self.direction = switch (action) {
+            .left => self.direction.left(),
+            .straight => self.direction,
+            .right => self.direction.right(),
+        };
+
+        const delta = self.direction.delta();
+        const next = Pos{
+            .x = self.head().x + delta.x,
+            .y = self.head().y + delta.y,
+        };
+
+        self.ticks += 1;
+        self.steps_since_food += 1;
+
+        const eating = Pos.eql(next, self.food);
+
+        if (!insideBoard(next) or self.collidesWithBody(next, eating)) {
+            self.status = .collision;
+            return events;
+        }
+
+        if (eating) {
+            if (self.length == board_cells) {
+                self.status = .cleared;
+                events.cleared = true;
+                return events;
+            }
+
+            var i = self.length;
+            while (i > 0) : (i -= 1) {
+                self.snake[i] = self.snake[i - 1];
+            }
+            self.snake[0] = next;
+            self.length += 1;
+
+            self.foods += 1;
+            self.steps_since_food = 0;
+            events.ate_food = true;
+
+            if (self.length == board_cells) {
+                self.status = .cleared;
+                events.cleared = true;
+                return events;
+            }
+
+            self.spawnFood();
+        } else {
+            var i = self.length - 1;
+            while (i > 0) : (i -= 1) {
+                self.snake[i] = self.snake[i - 1];
+            }
+            self.snake[0] = next;
+
+            const new_distance = manhattanDistance(
+                self.head(),
+                self.food,
+            );
+
+            // Potential-like shaping without the classic oscillation exploit:
+            // only reward a distance that has never been reached for this food.
+            if (new_distance < self.closest_food_distance) {
+                const d = self.closest_food_distance - new_distance;
+                events.progress_units = @intCast(d);
+                self.closest_food_distance = new_distance;
+            }
+        }
+
+        if (self.steps_since_food >= self.starvationBudget()) {
+            self.status = .starved;
+        }
+
+        return events;
+    }
+
+    fn starvationBudget(self: *const SnakeGame) usize {
+        // Near a full board, reaching a randomly spawned food can legitimately
+        // require hundreds of steps. Grow the budget with the snake instead of
+        // imposing a global episode duration.
+        return starvation_base + self.length * starvation_per_body_cell;
+    }
+
+    fn collidesWithBody(
+        self: *const SnakeGame,
+        next: Pos,
+        eating: bool,
+    ) bool {
+        // When not eating, the tail moves away in the same tick. It is legal
+        // for the new head to enter that old tail cell.
+        const check_len =
+            if (eating)
+                self.length
+            else
+                self.length - 1;
+
+        for (self.snake[0..check_len]) |part| {
+            if (Pos.eql(part, next)) return true;
+        }
+
+        return false;
+    }
+
+    fn wouldCollide(
+        self: *const SnakeGame,
+        direction: Direction,
+    ) bool {
+        const delta = direction.delta();
+        const next = Pos{
+            .x = self.head().x + delta.x,
+            .y = self.head().y + delta.y,
+        };
+
+        if (!insideBoard(next)) return true;
+
+        const eating = Pos.eql(next, self.food);
+        return self.collidesWithBody(next, eating);
+    }
+
+    fn contains(self: *const SnakeGame, pos: Pos) bool {
+        for (self.snake[0..self.length]) |part| {
+            if (Pos.eql(part, pos)) return true;
+        }
+        return false;
+    }
+
+    fn spawnFood(self: *SnakeGame) void {
+        const max_attempts = board_cells * 2;
+
+        for (0..max_attempts) |_| {
+            const index: usize = @intCast(
+                nextRandom(&self.rng_state) %
+                    @as(u64, @intCast(board_cells)),
+            );
+
+            const candidate = Pos{
+                .x = @intCast(index % board_width),
+                .y = @intCast(index / board_width),
+            };
+
+            if (!self.contains(candidate)) {
+                self.food = candidate;
+                self.closest_food_distance = manhattanDistance(
+                    self.head(),
+                    candidate,
+                );
+                return;
+            }
+        }
+
+        // Deterministic fallback for a nearly-full board.
+        for (0..board_cells) |index| {
+            const candidate = Pos{
+                .x = @intCast(index % board_width),
+                .y = @intCast(index / board_width),
+            };
+
+            if (!self.contains(candidate)) {
+                self.food = candidate;
+                self.closest_food_distance = manhattanDistance(
+                    self.head(),
+                    candidate,
+                );
+                return;
+            }
+        }
+
+        self.status = .cleared;
+    }
+};
+
+const Agent = struct {
+    game: SnakeGame,
+    episode_index: usize,
+
+    fitness: u64,
+    total_foods: u64,
+    total_steps: u64,
+    clears: u64,
+
+    done: bool,
+
+    fn init(seeds: *const [episode_count]u64) Agent {
+        return .{
+            .game = SnakeGame.init(seeds[0]),
+            .episode_index = 0,
+            .fitness = 0,
+            .total_foods = 0,
+            .total_steps = 0,
+            .clears = 0,
+            .done = false,
+        };
+    }
+
+    fn finishCurrentEpisode(
+        self: *Agent,
+        seeds: *const [episode_count]u64,
+    ) void {
+        self.total_foods += self.game.foods;
+        self.total_steps += self.game.ticks;
+
+        if (self.game.status == .cleared) {
+            self.clears += 1;
+        }
+
+        if (self.episode_index + 1 >= episode_count) {
+            self.done = true;
+            return;
+        }
+
+        self.episode_index += 1;
+        self.game = SnakeGame.init(
+            seeds[self.episode_index],
+        );
+    }
 };
 
 const GenerationStats = struct {
     generation: usize = 0,
-    age: usize = 0,
-    best: u64 = 0,
-    best_index: usize = 0,
-    worst: u64 = 0,
-    average: f64 = 0.0,
-    median: f64 = 0.0,
-    stddev: f64 = 0.0,
-    total: u64 = 0,
-    zero_count: usize = 0,
-    wall_bounces: u64 = 0,
-};
+    global_ticks: usize = 0,
 
-const BrainDiagnostics = struct {
-    output0_mean: f64 = 0.0,
-    output1_mean: f64 = 0.0,
-    output0_edge_count: usize = 0,
-    output1_edge_count: usize = 0,
-    speed_mean: f64 = 0.0,
+    best_fitness: u64 = 0,
+    best_index: usize = 0,
+    average_fitness: f64 = 0.0,
+
+    best_foods: u64 = 0,
+    average_foods: f64 = 0.0,
+
+    best_steps: u64 = 0,
+    total_clears: u64 = 0,
 };
 
 const Simulation = struct {
-    animals: [population_size]Animal,
-    foods: [food_count]Food,
+    agents: [population_size]Agent,
 
     parents: []Individual,
     children: []Individual,
-    buffer: Individual.PerThreadBuffer,
+
+    // One scratch buffer per parallel evaluation chunk. Individual.forward()
+    // mutates its scratch buffer, so sharing one here would be a data race.
+    eval_buffers: []Individual.PerThreadBuffer,
+    ga_buffer: Individual.PerThreadBuffer,
+    worker_count: usize,
 
     allocator: std.mem.Allocator,
+
     generation: usize,
-    age: usize,
+    global_ticks: usize,
 
     last_stats: GenerationStats,
-    best_ever: u64,
-    generation_bounces: u64,
+    best_ever_fitness: u64,
+    best_ever_foods: u64,
 
-    // Full, dynamically-grown completed-generation log.
-    // Q/Esc prints every entry before the process exits.
     stats_log: []GenerationStats,
     stats_len: usize,
 
-    // Small rolling window used only by the live graph.
     history: [history_capacity]f64,
     history_len: usize,
+
+    episode_seeds: [episode_count]u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
         random: std.Random,
     ) !Simulation {
         const layer_settings = [_]Individual.LayerSetting{
-            .{
-                .cols = input_count,
-                .rows = 2 * input_count,
-            },
-            .{
-                .cols = 2 * input_count,
-                .rows = 2,
-            },
+            .{ .cols = input_count, .rows = hidden0 },
+            .{ .cols = hidden0, .rows = hidden1 },
+            .{ .cols = hidden1, .rows = output_count },
         };
 
         const population_a = try allocPopulation(
@@ -589,48 +970,78 @@ const Simulation = struct {
         );
         errdefer freePopulation(allocator, population_b);
 
-        // Shorelark's original network uses ReLU. Keep Bitman's activation
-        // fixed to ReLU too, so output mapping remains predictable.
+        // activation_pfns[1] == leakyReLU8.
+        // Signed hidden values are useful; the final action is categorical
+        // argmax so there is no need to squash the output into [-1, 1].
         for (population_a) |*brain| {
-            brain.activation_pfn_index = 0;
+            brain.activation_pfn_index = 1;
         }
         for (population_b) |*brain| {
-            brain.activation_pfn_index = 0;
+            brain.activation_pfn_index = 1;
         }
 
-        var buffer = try Individual.PerThreadBuffer.init(
+        const logical_cpus = std.Thread.getCpuCount() catch 1;
+        const worker_count = @max(
+            1,
+            @min(population_size, @min(logical_cpus, 16)),
+        );
+
+        const eval_buffers = try allocator.alloc(
+            Individual.PerThreadBuffer,
+            worker_count,
+        );
+        errdefer allocator.free(eval_buffers);
+
+        var eval_buffers_initialized: usize = 0;
+        errdefer {
+            for (eval_buffers[0..eval_buffers_initialized]) |*buffer| {
+                buffer.deinit(allocator);
+            }
+        }
+
+        for (eval_buffers) |*buffer| {
+            buffer.* = try Individual.PerThreadBuffer.init(
+                allocator,
+                population_a[0].maxRowColLen(),
+                population_a[0].maxElementsLen(),
+            );
+            eval_buffers_initialized += 1;
+        }
+
+        var ga_buffer = try Individual.PerThreadBuffer.init(
             allocator,
             population_a[0].maxRowColLen(),
             population_a[0].maxElementsLen(),
         );
-        errdefer buffer.deinit(allocator);
+        errdefer ga_buffer.deinit(allocator);
 
         const stats_log = try allocator.alloc(
             GenerationStats,
-            initial_generation_log_capacity,
+            stats_capacity_initial,
         );
         errdefer allocator.free(stats_log);
 
         var sim = Simulation{
-            .animals = undefined,
-            .foods = undefined,
+            .agents = undefined,
             .parents = population_a,
             .children = population_b,
-            .buffer = buffer,
+            .eval_buffers = eval_buffers,
+            .ga_buffer = ga_buffer,
+            .worker_count = worker_count,
             .allocator = allocator,
             .generation = 0,
-            .age = 0,
+            .global_ticks = 0,
             .last_stats = .{},
-            .best_ever = 0,
-            .generation_bounces = 0,
+            .best_ever_fitness = 0,
+            .best_ever_foods = 0,
             .stats_log = stats_log,
             .stats_len = 0,
             .history = @splat(0.0),
             .history_len = 0,
+            .episode_seeds = undefined,
         };
 
-        sim.resetBodies(random);
-        sim.resetFoods(random);
+        sim.resetAgents();
 
         return sim;
     }
@@ -639,7 +1050,11 @@ const Simulation = struct {
         self: *Simulation,
         allocator: std.mem.Allocator,
     ) void {
-        self.buffer.deinit(allocator);
+        for (self.eval_buffers) |*buffer| {
+            buffer.deinit(allocator);
+        }
+        allocator.free(self.eval_buffers);
+        self.ga_buffer.deinit(allocator);
         freePopulation(allocator, self.parents);
         freePopulation(allocator, self.children);
         allocator.free(self.stats_log);
@@ -648,68 +1063,90 @@ const Simulation = struct {
 
     pub fn step(
         self: *Simulation,
+        io: std.Io,
         random: std.Random,
-    ) ?GenerationStats {
-        self.processCollisions(random);
-        self.processBrains();
-        self.processMovements();
+    ) !?GenerationStats {
+        self.global_ticks += 1;
+        try self.stepPopulationParallel(io);
 
-        self.age += 1;
-
-        if (self.age >= generation_length) {
+        if (self.allDone()) {
             return self.evolve(random);
         }
 
         return null;
     }
 
-    fn processCollisions(
+    fn stepPopulationParallel(self: *Simulation, io: std.Io) !void {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+
+        const chunk_size =
+            (population_size + self.worker_count - 1) / self.worker_count;
+
+        for (0..self.worker_count) |worker_index| {
+            const begin = worker_index * chunk_size;
+            if (begin >= population_size) break;
+            const end = @min(begin + chunk_size, population_size);
+
+            group.concurrent(
+                io,
+                stepPopulationRange,
+                .{ self, worker_index, begin, end },
+            ) catch {
+                // Keep the experiment portable to Io implementations which do
+                // not provide real concurrency. Ranges are disjoint, so doing
+                // this one inline is safe while other chunks are running.
+                stepPopulationRange(self, worker_index, begin, end);
+            };
+        }
+
+        try group.await(io);
+    }
+
+    fn stepPopulationRange(
         self: *Simulation,
-        random: std.Random,
+        worker_index: usize,
+        begin: usize,
+        end: usize,
     ) void {
-        const radius_sq = collision_radius * collision_radius;
+        const buffer = &self.eval_buffers[worker_index];
 
-        for (&self.animals) |*animal| {
-            for (&self.foods) |*food| {
-                const dx = food.pos.x - animal.pos.x;
-                const dy = food.pos.y - animal.pos.y;
-                const dist_sq = dx * dx + dy * dy;
+        for (begin..end) |i| {
+            const agent = &self.agents[i];
+            const brain = &self.parents[i];
+            if (agent.done) continue;
 
-                if (dist_sq <= radius_sq) {
-                    animal.satiation += 1;
-                    food.pos = randomPosition(random);
-                }
+            const input = makeInput(&agent.game);
+
+            _ = brain.forward(
+                &input,
+                input_gain,
+                buffer,
+            );
+
+            const action = chooseAction(brain.out);
+            const events = agent.game.step(action);
+
+            if (agent.game.status != .collision) {
+                agent.fitness += survival_reward;
             }
-        }
-    }
 
-    fn processBrains(self: *Simulation) void {
-        for (
-            &self.animals,
-            self.parents,
-        ) |*animal, *brain| {
-            const vision = makeVision(
-                animal,
-                &self.foods,
-            );
+            agent.fitness +=
+                @as(u64, events.progress_units) * progress_reward;
 
-            const output_gain = brain.forward(
-                &vision,
-                vision_gain,
-                &self.buffer,
-            );
+            if (events.ate_food) {
+                agent.fitness += food_reward;
+                agent.fitness +=
+                    agent.game.foods * food_chain_reward;
+            }
 
-            applyBrain(
-                animal,
-                brain.out,
-                output_gain,
-            );
-        }
-    }
+            if (events.cleared) {
+                agent.fitness += board_clear_reward;
+            }
 
-    fn processMovements(self: *Simulation) void {
-        for (&self.animals) |*animal| {
-            self.generation_bounces += @as(u64, moveAnimal(animal));
+            if (agent.game.status != .active) {
+                agent.finishCurrentEpisode(&self.episode_seeds);
+            }
         }
     }
 
@@ -720,19 +1157,20 @@ const Simulation = struct {
         const stats = self.currentStats();
 
         for (
-            &self.animals,
+            self.agents,
             self.parents,
-        ) |*animal, *brain| {
-            // +1 keeps roulette-wheel selection defined even if nobody
-            // managed to eat in the first generation.
-            brain.fitness = animal.satiation + 1;
+        ) |agent, *brain| {
+            brain.fitness = agent.fitness + 1;
         }
 
+        const elite_indices = self.eliteIndices();
+
+        // Breed only the non-elite slots.
         bitman.genetic_algorithm.evolve(
             random,
             self.parents,
-            self.children,
-            &self.buffer,
+            self.children[elite_count..],
+            &self.ga_buffer,
             .roulette_wheel,
             .uniform_crossover,
             .{
@@ -743,9 +1181,16 @@ const Simulation = struct {
             },
         );
 
-        // Keep activation semantics fixed across generations.
+        // Exact preservation of the best genomes.
+        for (0..elite_count) |i| {
+            copyGenome(
+                &self.parents[elite_indices[i]],
+                &self.children[i],
+            );
+        }
+
         for (self.children) |*brain| {
-            brain.activation_pfn_index = 0;
+            brain.activation_pfn_index = 1;
             brain.fitness = 0;
         }
 
@@ -754,119 +1199,174 @@ const Simulation = struct {
         self.children = temp;
 
         self.last_stats = stats;
-        self.best_ever = @max(self.best_ever, stats.best);
+        self.best_ever_fitness = @max(
+            self.best_ever_fitness,
+            stats.best_fitness,
+        );
+        self.best_ever_foods = @max(
+            self.best_ever_foods,
+            stats.best_foods,
+        );
+
         self.appendStats(stats);
-        self.pushHistory(stats.average);
+        self.pushHistory(stats.average_foods);
 
         self.generation += 1;
-        self.age = 0;
-        self.generation_bounces = 0;
-
-        // Only the genome survives. Physical state is born again.
-        self.resetBodies(random);
-        self.resetFoods(random);
+        self.global_ticks = 0;
+        self.resetAgents();
 
         return stats;
     }
 
-    fn currentStats(self: *const Simulation) GenerationStats {
-        var sorted: [population_size]u64 = undefined;
-        var total: u64 = 0;
-        var best: u64 = 0;
-        var best_index: usize = 0;
-        var worst: u64 = std.math.maxInt(u64);
-        var zero_count: usize = 0;
+    fn resetAgents(self: *Simulation) void {
+        self.refreshEpisodeSeeds();
 
-        for (self.animals, 0..) |animal, i| {
-            const eaten = animal.satiation;
-            sorted[i] = eaten;
-            total += eaten;
-
-            if (eaten > best) {
-                best = eaten;
-                best_index = i;
-            }
-            worst = @min(worst, eaten);
-            if (eaten == 0) zero_count += 1;
+        for (&self.agents) |*agent| {
+            agent.* = Agent.init(&self.episode_seeds);
         }
-
-        // population_size is tiny (40), so an allocation-free insertion sort
-        // is simpler and more stable across Zig versions than pulling in a
-        // generic sort helper just to compute the median.
-        for (1..population_size) |i| {
-            const value = sorted[i];
-            var j = i;
-            while (j > 0 and sorted[j - 1] > value) {
-                sorted[j] = sorted[j - 1];
-                j -= 1;
-            }
-            sorted[j] = value;
-        }
-
-        const average =
-            @as(f64, @floatFromInt(total)) /
-            @as(f64, @floatFromInt(population_size));
-
-        const middle = population_size / 2;
-        const median = if (population_size % 2 == 0)
-            (@as(f64, @floatFromInt(sorted[middle - 1])) +
-                @as(f64, @floatFromInt(sorted[middle]))) / 2.0
-        else
-            @as(f64, @floatFromInt(sorted[middle]));
-
-        var variance_sum: f64 = 0.0;
-        for (self.animals) |animal| {
-            const value = @as(f64, @floatFromInt(animal.satiation));
-            const delta = value - average;
-            variance_sum += delta * delta;
-        }
-
-        const variance = variance_sum /
-            @as(f64, @floatFromInt(population_size));
-
-        return .{
-            .generation = self.generation,
-            .age = self.age,
-            .best = best,
-            .best_index = best_index,
-            .worst = worst,
-            .average = average,
-            .median = median,
-            .stddev = @sqrt(variance),
-            .total = total,
-            .zero_count = zero_count,
-            .wall_bounces = self.generation_bounces,
-        };
     }
 
-    fn brainDiagnostics(self: *const Simulation) BrainDiagnostics {
-        var result = BrainDiagnostics{};
+    fn refreshEpisodeSeeds(self: *Simulation) void {
+        for (0..episode_count) |i| {
+            if (i < anchor_episode_count) {
+                self.episode_seeds[i] = anchor_episode_seeds[i];
+                continue;
+            }
 
-        for (self.animals, self.parents) |animal, brain| {
-            result.speed_mean += @as(f64, @floatCast(animal.speed));
+            // Every genome in the generation receives the same episodes, but
+            // most episodes change between generations. This preserves fair
+            // selection while resisting memorization of a tiny seed set.
+            const g: u64 = @intCast(self.generation + 1);
+            const j: u64 = @intCast(i + 1);
+            const seed =
+                0x534e_414b_455f_4556 ^
+                (g *% 0x9e37_79b9_7f4a_7c15) ^
+                (j *% 0xbf58_476d_1ce4_e5b9);
 
-            if (brain.out.len >= 2) {
-                const out0 = brain.out[0];
-                const out1 = brain.out[1];
-                const control0 = outputControl(out0, brain.out_gain);
-                const control1 = outputControl(out1, brain.out_gain);
+            self.episode_seeds[i] = splitMix64(seed);
+        }
+    }
 
-                result.output0_mean += @as(f64, @floatCast(control0));
-                result.output1_mean += @as(f64, @floatCast(control1));
+    fn allDone(self: *const Simulation) bool {
+        for (self.agents) |agent| {
+            if (!agent.done) return false;
+        }
+        return true;
+    }
 
-                if (@abs(control0) >= 0.9) result.output0_edge_count += 1;
-                if (@abs(control1) >= 0.9) result.output1_edge_count += 1;
+    fn bestIndex(self: *const Simulation) usize {
+        var best_index: usize = 0;
+        var best_fitness = self.agents[0].fitness;
+
+        for (self.agents[1..], 1..) |agent, i| {
+            if (agent.fitness > best_fitness) {
+                best_fitness = agent.fitness;
+                best_index = i;
             }
         }
 
-        const count = @as(f64, @floatFromInt(population_size));
-        result.speed_mean /= count;
-        result.output0_mean /= count;
-        result.output1_mean /= count;
+        return best_index;
+    }
+
+    fn displayIndex(self: *const Simulation) usize {
+        var found = false;
+        var result: usize = 0;
+        var best_fitness: u64 = 0;
+
+        for (self.agents, 0..) |agent, i| {
+            if (agent.done) continue;
+
+            if (!found or agent.fitness > best_fitness) {
+                found = true;
+                result = i;
+                best_fitness = agent.fitness;
+            }
+        }
+
+        return if (found) result else self.bestIndex();
+    }
+
+    fn eliteIndices(self: *const Simulation) [elite_count]usize {
+        var result: [elite_count]usize = undefined;
+        var selected: [population_size]bool = @splat(false);
+
+        for (0..elite_count) |rank| {
+            var found = false;
+            var best_index: usize = 0;
+            var best_fitness: u64 = 0;
+
+            for (self.agents, 0..) |agent, i| {
+                if (selected[i]) continue;
+
+                if (!found or agent.fitness > best_fitness) {
+                    found = true;
+                    best_index = i;
+                    best_fitness = agent.fitness;
+                }
+            }
+
+            std.debug.assert(found);
+            result[rank] = best_index;
+            selected[best_index] = true;
+        }
+
         return result;
     }
 
-    fn appendStats(self: *Simulation, stats: GenerationStats) void {
+    fn currentStats(self: *const Simulation) GenerationStats {
+        var total_fitness: u64 = 0;
+        var total_foods: u64 = 0;
+        var total_clears: u64 = 0;
+
+        var best_fitness: u64 = 0;
+        var best_index: usize = 0;
+        var best_foods: u64 = 0;
+        var best_steps: u64 = 0;
+
+        for (self.agents, 0..) |agent, i| {
+            const live_foods =
+                agent.total_foods +
+                if (!agent.done) agent.game.foods else 0;
+
+            const live_steps =
+                agent.total_steps +
+                if (!agent.done)
+                    @as(u64, @intCast(agent.game.ticks))
+                else
+                    0;
+
+            total_fitness += agent.fitness;
+            total_foods += live_foods;
+            total_clears += agent.clears;
+
+            if (agent.fitness > best_fitness) {
+                best_fitness = agent.fitness;
+                best_index = i;
+            }
+
+            best_foods = @max(best_foods, live_foods);
+            best_steps = @max(best_steps, live_steps);
+        }
+
+        const count = @as(f64, @floatFromInt(population_size));
+
+        return .{
+            .generation = self.generation,
+            .global_ticks = self.global_ticks,
+            .best_fitness = best_fitness,
+            .best_index = best_index,
+            .average_fitness = @as(f64, @floatFromInt(total_fitness)) / count,
+            .best_foods = best_foods,
+            .average_foods = @as(f64, @floatFromInt(total_foods)) / count,
+            .best_steps = best_steps,
+            .total_clears = total_clears,
+        };
+    }
+
+    fn appendStats(
+        self: *Simulation,
+        stats: GenerationStats,
+    ) void {
         if (self.stats_len == self.stats_log.len) {
             const new_capacity = @max(self.stats_log.len * 2, 1);
             self.stats_log = self.allocator.realloc(
@@ -894,57 +1394,208 @@ const Simulation = struct {
         }
         self.history[history_capacity - 1] = value;
     }
-
-    fn resetBodies(
-        self: *Simulation,
-        random: std.Random,
-    ) void {
-        for (&self.animals) |*animal| {
-            animal.* = .{
-                .pos = randomPosition(random),
-                .rotation = random.float(f32) * tau - pi,
-                .speed = speed_initial,
-                .satiation = 0,
-            };
-        }
-    }
-
-    fn resetFoods(
-        self: *Simulation,
-        random: std.Random,
-    ) void {
-        for (&self.foods) |*food| {
-            food.* = .{
-                .pos = randomPosition(random),
-            };
-        }
-    }
-
-    fn leaderIndex(self: *const Simulation) usize {
-        var leader: usize = 0;
-        var best: u64 = self.animals[0].satiation;
-
-        for (self.animals[1..], 1..) |animal, i| {
-            if (animal.satiation > best) {
-                best = animal.satiation;
-                leader = i;
-            }
-        }
-
-        return leader;
-    }
-
-    fn currentAverage(self: *const Simulation) f64 {
-        var total: u64 = 0;
-
-        for (self.animals) |animal| {
-            total += animal.satiation;
-        }
-
-        return @as(f64, @floatFromInt(total)) /
-            @as(f64, @floatFromInt(population_size));
-    }
 };
+
+// ============================================================================
+// NETWORK INPUT / OUTPUT
+// ============================================================================
+
+const RaySense = struct {
+    wall_proximity: f32,
+    body_proximity: f32,
+    food_visibility: f32,
+};
+
+fn makeInput(game: *const SnakeGame) [input_count]i8 {
+    var result: [input_count]i8 = @splat(0);
+
+    result[0] = quantizeBool(game.wouldCollide(game.direction));
+    result[1] = quantizeBool(game.wouldCollide(game.direction.left()));
+    result[2] = quantizeBool(game.wouldCollide(game.direction.right()));
+
+    // Eight body-relative rays: F, FR, R, BR, B, BL, L, FL.
+    // Because actions are also relative, the controller does not have to learn
+    // four rotated copies of the same wall/body avoidance policy.
+    const forward = game.direction.delta();
+    const right = game.direction.right().delta();
+    const back = game.direction.right().right().delta();
+    const left = game.direction.left().delta();
+
+    const ray_deltas = [_]Pos{
+        forward,
+        addPos(forward, right),
+        right,
+        addPos(back, right),
+        back,
+        addPos(back, left),
+        left,
+        addPos(forward, left),
+    };
+
+    for (ray_deltas, 0..) |delta, ray_index| {
+        const sense = senseRay(game, delta);
+        const base = 3 + ray_index * 3;
+
+        result[base + 0] = quantizeZeroOne(sense.wall_proximity);
+        result[base + 1] = quantizeZeroOne(sense.body_proximity);
+        result[base + 2] = quantizeZeroOne(sense.food_visibility);
+    }
+
+    const head = game.head();
+    const to_food = Pos{
+        .x = game.food.x - head.x,
+        .y = game.food.y - head.y,
+    };
+
+    const food_forward =
+        @as(i32, to_food.x) * @as(i32, forward.x) +
+        @as(i32, to_food.y) * @as(i32, forward.y);
+    const food_right =
+        @as(i32, to_food.x) * @as(i32, right.x) +
+        @as(i32, to_food.y) * @as(i32, right.y);
+
+    const max_axis: f32 = @as(
+        f32,
+        @floatFromInt(@max(board_width - 1, board_height - 1)),
+    );
+
+    // Local coordinates remove the need to relearn the same food-seeking rule
+    // four times for four absolute headings.
+    result[27] = quantizeUnit(@as(f32, @floatFromInt(food_forward)) / max_axis);
+    result[28] = quantizeUnit(@as(f32, @floatFromInt(food_right)) / max_axis);
+
+    result[29] = quantizeZeroOne(
+        @as(f32, @floatFromInt(game.steps_since_food)) /
+            @as(f32, @floatFromInt(game.starvationBudget())),
+    );
+    result[30] = quantizeZeroOne(
+        @as(f32, @floatFromInt(game.length)) /
+            @as(f32, @floatFromInt(board_cells)),
+    );
+
+    // Explicit affine offset instead of BitLinear bias.
+    result[31] = 127;
+
+    return result;
+}
+
+fn senseRay(game: *const SnakeGame, delta: Pos) RaySense {
+    std.debug.assert(delta.x != 0 or delta.y != 0);
+
+    var pos = game.head();
+    var distance: usize = 0;
+    var body_proximity: f32 = 0.0;
+    var food_visibility: f32 = 0.0;
+
+    while (true) {
+        distance += 1;
+        pos.x += delta.x;
+        pos.y += delta.y;
+
+        const inv_distance = 1.0 / @as(f32, @floatFromInt(distance));
+
+        if (!insideBoard(pos)) {
+            return .{
+                .wall_proximity = inv_distance,
+                .body_proximity = body_proximity,
+                .food_visibility = food_visibility,
+            };
+        }
+
+        if (food_visibility == 0.0 and Pos.eql(pos, game.food)) {
+            food_visibility = inv_distance;
+        }
+
+        if (body_proximity == 0.0 and game.contains(pos)) {
+            body_proximity = inv_distance;
+        }
+    }
+}
+
+fn quantizeBool(value: bool) i8 {
+    return if (value) 127 else -127;
+}
+
+fn quantizeUnit(value: f32) i8 {
+    const x = std.math.clamp(value, -1.0, 1.0);
+    const q: i32 = @intFromFloat(@round(x * 127.0));
+    return @intCast(std.math.clamp(q, -127, 127));
+}
+
+fn quantizeZeroOne(value: f32) i8 {
+    const x = std.math.clamp(value, 0.0, 1.0);
+    const q: i32 = @intFromFloat(@round(x * 127.0));
+    return @intCast(std.math.clamp(q, 0, 127));
+}
+
+fn chooseAction(output: []const i8) RelativeAction {
+    std.debug.assert(output.len >= 3);
+
+    // Prefer STRAIGHT on exact ties. This makes an all-zero newborn controller
+    // less pathological than always turning left.
+    var action: RelativeAction = .straight;
+    var best = output[1];
+
+    if (output[0] > best) {
+        best = output[0];
+        action = .left;
+    }
+
+    if (output[2] > best) {
+        action = .right;
+    }
+
+    return action;
+}
+
+fn realOutput(value: i8, out_gain: f32) f32 {
+    return @as(f32, @floatFromInt(value)) * out_gain;
+}
+
+// ============================================================================
+// WORLD HELPERS
+// ============================================================================
+
+fn addPos(a: Pos, b: Pos) Pos {
+    return .{
+        .x = a.x + b.x,
+        .y = a.y + b.y,
+    };
+}
+
+fn insideBoard(pos: Pos) bool {
+    return pos.x >= 0 and
+        pos.y >= 0 and
+        pos.x < board_width and
+        pos.y < board_height;
+}
+
+fn manhattanDistance(a: Pos, b: Pos) i32 {
+    const dx = @abs(@as(i32, a.x) - @as(i32, b.x));
+    const dy = @abs(@as(i32, a.y) - @as(i32, b.y));
+    return @intCast(dx + dy);
+}
+
+fn nextRandom(state: *u64) u64 {
+    // xorshift64*; state must be nonzero.
+    var x = state.*;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    state.* = x;
+    return x *% 0x2545_f491_4f6c_dd1d;
+}
+
+fn splitMix64(seed: u64) u64 {
+    var z = seed +% 0x9e37_79b9_7f4a_7c15;
+    z = (z ^ (z >> 30)) *% 0xbf58_476d_1ce4_e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d0_49bb_1331_11eb;
+    return z ^ (z >> 31);
+}
+
+// ============================================================================
+// POPULATION HELPERS
+// ============================================================================
 
 fn allocPopulation(
     allocator: std.mem.Allocator,
@@ -972,7 +1623,7 @@ fn allocPopulation(
             random,
             layer_settings,
             init_method,
-            true,
+            false,
         );
         initialized += 1;
     }
@@ -990,188 +1641,39 @@ fn freePopulation(
     allocator.free(population);
 }
 
-fn randomPosition(random: std.Random) Vec2 {
-    return .{
-        .x = random.float(f32),
-        .y = random.float(f32),
-    };
-}
+fn copyGenome(
+    src: *const Individual,
+    dst: *Individual,
+) void {
+    std.debug.assert(src.layers.len == dst.layers.len);
+    std.debug.assert(src.out.len == dst.out.len);
 
-// ============================================================================
-// EYE
-// ============================================================================
+    for (src.layers, dst.layers) |src_layer, *dst_layer| {
+        std.debug.assert(src_layer.rows == dst_layer.rows);
+        std.debug.assert(src_layer.cols == dst_layer.cols);
+        std.debug.assert(src_layer.weights.len == dst_layer.weights.len);
+        std.debug.assert(src_layer.biases.len == dst_layer.biases.len);
 
-fn makeVision(
-    animal: *const Animal,
-    foods: *const [food_count]Food,
-) [input_count]i8 {
-    var cells: [eye_cells]f32 = @splat(0.0);
-
-    for (foods) |food| {
-        const dx = food.pos.x - animal.pos.x;
-        const dy = food.pos.y - animal.pos.y;
-
-        const dist_sq = dx * dx + dy * dy;
-        if (dist_sq >= fov_range * fov_range) continue;
-
-        const dist = @sqrt(dist_sq);
-
-        // With our convention:
-        //   0      = up
-        //   PI/2   = right
-        // atan2(dx, -dy) follows exactly that coordinate system.
-        const absolute_angle = std.math.atan2(
-            dx,
-            -dy,
-        );
-
-        const relative_angle = wrapAngle(
-            absolute_angle - animal.rotation,
-        );
-
-        const half_fov = fov_angle / 2.0;
-        if (relative_angle < -half_fov or
-            relative_angle > half_fov)
-        {
-            continue;
+        @memcpy(dst_layer.weights, src_layer.weights);
+        if (dst_layer.biases.len != 0) {
+            @memcpy(dst_layer.biases, src_layer.biases);
         }
 
-        const unit =
-            (relative_angle + half_fov) /
-            fov_angle;
-
-        var cell: usize = @intFromFloat(
-            unit *
-                @as(f32, @floatFromInt(eye_cells)),
-        );
-
-        cell = @min(cell, eye_cells - 1);
-
-        const energy =
-            (fov_range - dist) /
-            fov_range;
-
-        cells[cell] += energy;
+        dst_layer.weights_gain = src_layer.weights_gain;
     }
 
-    var result: [input_count]i8 = @splat(0);
-
-    for (cells, 0..) |energy, i| {
-        const clamped = std.math.clamp(
-            energy,
-            0.0,
-            1.0,
-        );
-
-        result[i] = @intFromFloat(
-            clamped * 127.0,
-        );
-    }
-
-    return result;
-}
-
-// ============================================================================
-// BRAIN + PHYSICS
-// ============================================================================
-
-fn applyBrain(
-    animal: *Animal,
-    output: []const i8,
-    output_gain: f32,
-) void {
-    std.debug.assert(output.len >= 2);
-
-    const speed_control = outputControl(output[0], output_gain);
-    const turn_control = outputControl(output[1], output_gain);
-
-    animal.speed = std.math.clamp(
-        animal.speed +
-            speed_control * speed_accel,
-        speed_min,
-        speed_max,
-    );
-
-    animal.rotation = wrapAngle(
-        animal.rotation +
-            turn_control * rotation_accel,
-    );
-}
-
-fn outputControl(value: i8, output_gain: f32) f32 {
-    std.debug.assert(std.math.isFinite(output_gain));
-    std.debug.assert(output_gain > 0.0);
-
-    const real_output =
-        @as(f32, @floatFromInt(value)) * output_gain;
-
-    return std.math.clamp(real_output, 0.0, 2.0) - 1.0;
-}
-
-fn moveAnimal(animal: *Animal) u8 {
-    var bounces: u8 = 0;
-    var vx =
-        @sin(animal.rotation) *
-        animal.speed;
-    var vy =
-        -@cos(animal.rotation) *
-        animal.speed;
-
-    var x = animal.pos.x + vx;
-    var y = animal.pos.y + vy;
-
-    // Bounce from walls instead of wrapping to the opposite edge.
-    if (x < 0.0) {
-        x = -x;
-        vx = -vx;
-        bounces += 1;
-    } else if (x > 1.0) {
-        x = 2.0 - x;
-        vx = -vx;
-        bounces += 1;
-    }
-
-    if (y < 0.0) {
-        y = -y;
-        vy = -vy;
-        bounces += 1;
-    } else if (y > 1.0) {
-        y = 2.0 - y;
-        vy = -vy;
-        bounces += 1;
-    }
-
-    animal.pos.x = std.math.clamp(x, 0.0, 1.0);
-    animal.pos.y = std.math.clamp(y, 0.0, 1.0);
-
-    // Recover our angle convention from the reflected velocity.
-    animal.rotation = wrapAngle(
-        std.math.atan2(
-            vx,
-            -vy,
-        ),
-    );
-
-    return bounces;
-}
-
-fn wrapAngle(value: f32) f32 {
-    var angle = value;
-
-    while (angle < -pi) {
-        angle += tau;
-    }
-
-    while (angle >= pi) {
-        angle -= tau;
-    }
-
-    return angle;
+    dst.activation_pfn_index = src.activation_pfn_index;
+    dst.out_gain = 1.0;
+    dst.fitness = 0;
+    @memset(dst.out, 0);
 }
 
 // ============================================================================
 // RENDERING
 // ============================================================================
+
+const cell_width = 2;
+const world_draw_width = board_width * cell_width;
 
 fn render(
     console: *WinConsole,
@@ -1180,20 +1682,33 @@ fn render(
 ) void {
     var frame = Frame.init();
 
-    const leader_index = sim.leaderIndex();
-    const leader = &sim.animals[leader_index];
-    const leader_brain = &sim.parents[leader_index];
-    const leader_vision = makeVision(
-        leader,
-        &sim.foods,
-    );
-    const current_stats = sim.currentStats();
-    const brain_diag = sim.brainDiagnostics();
+    const current = sim.currentStats();
+    const display_index = sim.displayIndex();
+    const best_index = sim.bestIndex();
+
+    const agent = &sim.agents[display_index];
+    const brain = &sim.parents[display_index];
+    const game = &agent.game;
+
+    const have_output =
+        sim.global_ticks != 0 and
+        brain.out.len >= 3;
+
+    const q_left: i8 = if (have_output) brain.out[0] else 0;
+    const q_straight: i8 = if (have_output) brain.out[1] else 0;
+    const q_right: i8 = if (have_output) brain.out[2] else 0;
+    const out_gain: f32 = if (have_output) brain.out_gain else 1.0;
+
+    const action =
+        if (have_output)
+            chooseAction(brain.out)
+        else
+            RelativeAction.straight;
 
     frame.write(
         0,
         0,
-        "BITMAN SHORELARK // pt4 live evolution // Win32 console",
+        "BITMAN SNAKE // evolutionary controller // Win32 console",
         COLOR_CYAN,
     );
 
@@ -1201,13 +1716,12 @@ fn render(
         0,
         1,
         COLOR_WHITE,
-        "generation {d:<6} age {d:>4}/{d:<4} population {d} food {d} speed-mode {s}",
+        "generation {d:<5} tick {d:<5} population {d} episodes {d} speed-mode {s}",
         .{
             sim.generation,
-            sim.age,
-            generation_length,
+            sim.global_ticks,
             population_size,
-            food_count,
+            episode_count,
             mode.name(),
         },
     );
@@ -1216,13 +1730,13 @@ fn render(
         0,
         2,
         COLOR_WHITE,
-        "current: leader eaten {d:<5} avg {d:<8.3}    previous: best {d:<5} avg {d:<8.3}    best-ever {d}",
+        "current: best fitness {d:<9} avg {d:<10.1} best food {d:<4} avg food {d:<6.2} best steps {d}",
         .{
-            leader.satiation,
-            current_stats.average,
-            sim.last_stats.best,
-            sim.last_stats.average,
-            sim.best_ever,
+            current.best_fitness,
+            current.average_fitness,
+            current.best_foods,
+            current.average_foods,
+            current.best_steps,
         },
     );
 
@@ -1230,33 +1744,35 @@ fn render(
         0,
         3,
         COLOR_DIM,
-        "brain 9->18->2 | eye 9 cells / range .25 / fov 225deg | mutation {d:.2}% coeff {d:.2} | walls=bounce",
+        "previous: best fitness {d:<9} avg food {d:<6.2} best food {d:<4} | best-ever food {d}",
         .{
-            mutation_chance * 100.0,
-            mutation_coeff,
+            sim.last_stats.best_fitness,
+            sim.last_stats.average_foods,
+            sim.last_stats.best_foods,
+            sim.best_ever_foods,
         },
     );
 
     frame.writeFmt(
         0,
         4,
-        COLOR_WHITE,
-        "population now: best {d:<4} median {d:<6.2} avg {d:<7.3} worst {d:<4} sd {d:<6.2} zero {d:<3} bounces {d}",
+        COLOR_DIM,
+        "brain {d}->{d}->{d}->{d} | workers {d} | elite {d} | mutation {d:.3}%",
         .{
-            current_stats.best,
-            current_stats.median,
-            current_stats.average,
-            current_stats.worst,
-            current_stats.stddev,
-            current_stats.zero_count,
-            current_stats.wall_bounces,
+            input_count,
+            hidden0,
+            hidden1,
+            output_count,
+            sim.worker_count,
+            elite_count,
+            mutation_chance * 100.0,
         },
     );
 
     frame.write(
         0,
         5,
-        "keys: [1] slow  [2] normal  [3] fast  [4] turbo  [Q/Esc] print full history + quit",
+        "keys: [1] slow  [2] normal  [3] fast  [4] turbo  [Q/Esc] history + quit",
         COLOR_YELLOW,
     );
 
@@ -1269,188 +1785,179 @@ fn render(
         grid_y,
     );
 
-    for (sim.foods) |food| {
-        const gx, const gy = worldToGrid(food.pos);
+    drawGame(
+        &frame,
+        game,
+        grid_x,
+        grid_y,
+    );
 
-        frame.put(
-            grid_x + 1 + gx,
-            grid_y + 1 + gy,
-            '*',
-            COLOR_GREEN,
-        );
-    }
-
-    // Ordinary animals first.
-    for (sim.animals, 0..) |animal, i| {
-        if (i == leader_index) continue;
-
-        const gx, const gy = worldToGrid(animal.pos);
-
-        frame.put(
-            grid_x + 1 + gx,
-            grid_y + 1 + gy,
-            directionChar(animal.rotation),
-            COLOR_WHITE,
-        );
-    }
-
-    // Current leader last, so it remains visible if cells overlap.
-    {
-        const gx, const gy = worldToGrid(leader.pos);
-
-        frame.put(
-            grid_x + 1 + gx,
-            grid_y + 1 + gy,
-            '@',
-            COLOR_YELLOW,
-        );
-    }
-
-    const panel_x: usize = 94;
+    const panel_x: usize = 64;
 
     frame.write(
         panel_x,
-        8,
-        "CURRENT LEADER",
+        7,
+        "VIEWED AGENT",
         COLOR_YELLOW,
+    );
+
+    frame.writeFmt(
+        panel_x,
+        9,
+        COLOR_WHITE,
+        "index       {d}   best-index {d}",
+        .{ display_index, best_index },
     );
 
     frame.writeFmt(
         panel_x,
         10,
         COLOR_WHITE,
-        "index      {d}",
-        .{leader_index},
+        "episode     {d}/{d}",
+        .{ agent.episode_index + 1, episode_count },
     );
 
     frame.writeFmt(
         panel_x,
         11,
         COLOR_WHITE,
-        "eaten      {d}",
-        .{leader.satiation},
+        "status      {s}",
+        .{game.status.name()},
     );
 
     frame.writeFmt(
         panel_x,
         12,
         COLOR_WHITE,
-        "speed      {d:.5}",
-        .{leader.speed},
+        "fitness     {d}",
+        .{agent.fitness},
     );
 
     frame.writeFmt(
         panel_x,
         13,
         COLOR_WHITE,
-        "angle      {d:.1} deg",
-        .{angleDegrees(leader.rotation)},
+        "food(ep)    {d}   total {d}",
+        .{ game.foods, agent.total_foods },
     );
 
-    frame.write(
+    frame.writeFmt(
+        panel_x,
+        14,
+        COLOR_WHITE,
+        "length      {d}",
+        .{game.length},
+    );
+
+    frame.writeFmt(
         panel_x,
         15,
-        "eye",
-        COLOR_CYAN,
+        COLOR_WHITE,
+        "ticks       {d}   hungry {d}/{d}",
+        .{
+            game.ticks,
+            game.steps_since_food,
+            game.starvationBudget(),
+        },
+    );
+
+    frame.writeFmt(
+        panel_x,
+        16,
+        COLOR_WHITE,
+        "direction   {s}",
+        .{game.direction.name()},
     );
 
     frame.write(
         panel_x,
-        16,
-        "[",
-        COLOR_WHITE,
+        18,
+        "BRAIN OUTPUT",
+        COLOR_CYAN,
     );
-
-    var eye_chars: [eye_cells]u8 = undefined;
-    for (leader_vision, 0..) |value, i| {
-        eye_chars[i] = visionChar(value);
-    }
-
-    frame.write(
-        panel_x + 1,
-        16,
-        eye_chars[0..],
-        COLOR_GREEN,
-    );
-
-    frame.write(
-        panel_x + 1 + eye_cells,
-        16,
-        "]",
-        COLOR_WHITE,
-    );
-
-    if (leader_brain.out.len >= 2) {
-        frame.writeFmt(
-            panel_x,
-            18,
-            COLOR_WHITE,
-            "brain[0]   {d:>4}",
-            .{leader_brain.out[0]},
-        );
-
-        frame.writeFmt(
-            panel_x,
-            19,
-            COLOR_WHITE,
-            "brain[1]   {d:>4}",
-            .{leader_brain.out[1]},
-        );
-    }
 
     frame.writeFmt(
         panel_x,
         20,
-        COLOR_DIM,
-        "out mean {d:>5.1}/{d:<5.1}",
-        .{ brain_diag.output0_mean, brain_diag.output1_mean },
+        COLOR_WHITE,
+        "q L/S/R     {d:>4} {d:>4} {d:>4}",
+        .{ q_left, q_straight, q_right },
     );
 
     frame.writeFmt(
         panel_x,
         21,
-        COLOR_DIM,
-        "edge     {d:>3}%/{d:<3}%",
+        COLOR_WHITE,
+        "out gain    {d:.6}",
+        .{out_gain},
+    );
+
+    frame.writeFmt(
+        panel_x,
+        22,
+        COLOR_WHITE,
+        "real L/S/R  {d:>6.2} {d:>6.2} {d:>6.2}",
         .{
-            brain_diag.output0_edge_count * 100 / population_size,
-            brain_diag.output1_edge_count * 100 / population_size,
+            realOutput(q_left, out_gain),
+            realOutput(q_straight, out_gain),
+            realOutput(q_right, out_gain),
         },
+    );
+
+    frame.writeFmt(
+        panel_x,
+        23,
+        COLOR_YELLOW,
+        "action      {s}",
+        .{action.name()},
+    );
+
+    const input = makeInput(game);
+
+    frame.write(
+        panel_x,
+        25,
+        "INPUT",
+        COLOR_CYAN,
+    );
+
+    frame.writeFmt(
+        panel_x,
+        27,
+        COLOR_WHITE,
+        "danger S/L/R {d:>4} {d:>4} {d:>4}",
+        .{ input[0], input[1], input[2] },
+    );
+
+    frame.writeFmt(
+        panel_x,
+        28,
+        COLOR_WHITE,
+        "food local F/R {d:>4} {d:>4}",
+        .{ input[27], input[28] },
+    );
+
+    frame.writeFmt(
+        panel_x,
+        29,
+        COLOR_WHITE,
+        "hunger/length  {d:>4} {d:>4}",
+        .{ input[29], input[30] },
     );
 
     frame.write(
         panel_x,
-        23,
-        "AVG / GENERATION",
+        31,
+        "AVG FOOD / GENERATION",
         COLOR_CYAN,
     );
 
     drawHistory(
         &frame,
         panel_x,
-        25,
+        33,
         &sim.history,
         sim.history_len,
-    );
-
-    frame.write(
-        panel_x,
-        38,
-        "* food",
-        COLOR_GREEN,
-    );
-
-    frame.write(
-        panel_x,
-        39,
-        "@ current leader",
-        COLOR_YELLOW,
-    );
-
-    frame.write(
-        panel_x,
-        40,
-        "^ > v < birds",
-        COLOR_WHITE,
     );
 
     console.present(&frame);
@@ -1463,7 +1970,7 @@ fn drawWorldBorder(
 ) void {
     frame.put(x, y, '+', COLOR_DIM);
 
-    for (0..grid_width) |ix| {
+    for (0..world_draw_width) |ix| {
         frame.put(
             x + 1 + ix,
             y,
@@ -1473,13 +1980,13 @@ fn drawWorldBorder(
     }
 
     frame.put(
-        x + grid_width + 1,
+        x + world_draw_width + 1,
         y,
         '+',
         COLOR_DIM,
     );
 
-    for (0..grid_height) |iy| {
+    for (0..board_height) |iy| {
         frame.put(
             x,
             y + 1 + iy,
@@ -1488,14 +1995,14 @@ fn drawWorldBorder(
         );
 
         frame.put(
-            x + grid_width + 1,
+            x + world_draw_width + 1,
             y + 1 + iy,
             '|',
             COLOR_DIM,
         );
     }
 
-    const bottom = y + grid_height + 1;
+    const bottom = y + board_height + 1;
 
     frame.put(
         x,
@@ -1504,7 +2011,7 @@ fn drawWorldBorder(
         COLOR_DIM,
     );
 
-    for (0..grid_width) |ix| {
+    for (0..world_draw_width) |ix| {
         frame.put(
             x + 1 + ix,
             bottom,
@@ -1514,10 +2021,75 @@ fn drawWorldBorder(
     }
 
     frame.put(
-        x + grid_width + 1,
+        x + world_draw_width + 1,
         bottom,
         '+',
         COLOR_DIM,
+    );
+}
+
+fn drawGame(
+    frame: *Frame,
+    game: *const SnakeGame,
+    grid_x: usize,
+    grid_y: usize,
+) void {
+    // Food first.
+    putCell(
+        frame,
+        grid_x,
+        grid_y,
+        game.food,
+        "**",
+        COLOR_RED,
+    );
+
+    // Body tail-to-head so the head always wins overlaps.
+    var i = game.length;
+    while (i > 1) {
+        i -= 1;
+        putCell(
+            frame,
+            grid_x,
+            grid_y,
+            game.snake[i],
+            "oo",
+            COLOR_GREEN,
+        );
+    }
+
+    putCell(
+        frame,
+        grid_x,
+        grid_y,
+        game.head(),
+        "@@",
+        COLOR_YELLOW,
+    );
+}
+
+fn putCell(
+    frame: *Frame,
+    grid_x: usize,
+    grid_y: usize,
+    pos: Pos,
+    text: []const u8,
+    color: WORD,
+) void {
+    if (!insideBoard(pos)) return;
+
+    const x =
+        grid_x + 1 +
+        @as(usize, @intCast(pos.x)) * cell_width;
+    const y =
+        grid_y + 1 +
+        @as(usize, @intCast(pos.y));
+
+    frame.write(
+        x,
+        y,
+        text,
+        color,
     );
 }
 
@@ -1528,7 +2100,7 @@ fn drawHistory(
     history: *const [history_capacity]f64,
     history_len: usize,
 ) void {
-    const graph_height: usize = 10;
+    const graph_height: usize = 7;
 
     if (history_len == 0) {
         frame.write(
@@ -1543,10 +2115,7 @@ fn drawHistory(
     var max_value: f64 = 1.0;
 
     for (history[0..history_len]) |value| {
-        max_value = @max(
-            max_value,
-            value,
-        );
+        max_value = @max(max_value, value);
     }
 
     for (0..history_len) |i| {
@@ -1560,131 +2129,96 @@ fn drawHistory(
             normalized *
             @as(f64, @floatFromInt(graph_height - 1));
 
-        const graph_y: usize =
+        const graph_y =
             graph_height - 1 -
             @as(usize, @intFromFloat(@round(height_f)));
 
         frame.put(
             x + i,
             y + graph_y,
-            '#',
+            '*',
             COLOR_GREEN,
         );
     }
 
     frame.writeFmt(
         x,
-        y + graph_height + 1,
+        y + graph_height,
         COLOR_DIM,
         "max avg {d:.2}",
         .{max_value},
     );
 }
 
-fn worldToGrid(
-    pos: Vec2,
-) struct { usize, usize } {
-    var x: usize = @intFromFloat(
-        pos.x *
-            @as(f32, @floatFromInt(grid_width)),
-    );
-
-    var y: usize = @intFromFloat(
-        pos.y *
-            @as(f32, @floatFromInt(grid_height)),
-    );
-
-    x = @min(x, grid_width - 1);
-    y = @min(y, grid_height - 1);
-
-    return .{ x, y };
-}
-
-fn directionChar(rotation: f32) u8 {
-    var r = rotation;
-    if (r < 0.0) r += tau;
-
-    const sector: usize = @intFromFloat(
-        (r + pi / 4.0) /
-            (pi / 2.0),
-    );
-
-    return switch (sector % 4) {
-        0 => '^',
-        1 => '>',
-        2 => 'v',
-        3 => '<',
-        else => unreachable,
-    };
-}
-
-fn visionChar(value: i8) u8 {
-    if (value >= 96) return '#';
-    if (value >= 48) return '+';
-    if (value > 0) return '.';
-    return ' ';
-}
-
-fn angleDegrees(rotation: f32) f32 {
-    var r = rotation;
-    if (r < 0.0) r += tau;
-
-    return r * 180.0 / pi;
-}
+// ============================================================================
+// FINAL REPORT
+// ============================================================================
 
 fn printFinalReport(sim: *const Simulation) void {
     const current = sim.currentStats();
 
     std.debug.print(
-        "\n\n================ BITMAN SHORELARK: FULL EVOLUTION HISTORY ================\n",
+        "\n\n================ BITMAN SNAKE: EVOLUTION HISTORY ================\n",
         .{},
     );
+
     std.debug.print(
-        "completed generations: {d} | stopped at generation {d}, age {d}/{d}\n",
-        .{ sim.stats_len, sim.generation, sim.age, generation_length },
-    );
-    std.debug.print(
-        "brain {d}->{d}->2 | population {d} | food {d} respawning | mutation {d:.2}% coeff {d:.2}\n",
+        "brain {d}->{d}->{d}->{d} | population {d} | episodes/genome {d} (anchors {d})\n",
         .{
             input_count,
-            2 * input_count,
+            hidden0,
+            hidden1,
+            output_count,
             population_size,
-            food_count,
-            mutation_chance * 100.0,
-            mutation_coeff,
+            episode_count,
+            anchor_episode_count,
         },
     );
+
     std.debug.print(
-        "walls=bounce | generation ticks={d} | eye={d} cells range={d:.2} fov={d:.1}deg\n\n",
-        .{ generation_length, eye_cells, fov_range, fov_angle * 180.0 / pi },
+        "input_gain={d:.8} | 8-ray sensors | leakyReLU8 | explicit constant | no bias\n",
+        .{input_gain},
+    );
+
+    std.debug.print(
+        "elitism={d} unchanged | mutation={d:.3}% coeff={d:.3} | no hard tick cap | workers={d}\n",
+        .{
+            elite_count,
+            mutation_chance * 100.0,
+            mutation_coeff,
+            sim.worker_count,
+        },
+    );
+
+    std.debug.print(
+        "hunger budget={d}+{d}*length | rotating seeds | board clear ends episode\n\n",
+        .{ starvation_base, starvation_per_body_cell },
     );
 
     if (sim.stats_len == 0) {
         std.debug.print("No generation finished before quit.\n", .{});
     } else {
         std.debug.print(
-            " gen | best(idx) |    avg | median | worst |  stddev | zero | total | bounces\n",
+            " gen | best fitness | avg fitness | best food | avg food | best steps | clears | ticks\n",
             .{},
         );
         std.debug.print(
-            "-----+-----------+--------+--------+-------+---------+------+-------+--------\n",
+            "-----+--------------+-------------+-----------+----------+------------+--------+------\n",
             .{},
         );
 
         for (sim.stats_log[0..sim.stats_len]) |stats| {
             std.debug.print(
-                "{d:>4} | {d:>4}({d:>2}) | {d:>6.2} | {d:>6.2} | {d:>5} | {d:>7.2} | {d:>4} | {d:>5} | {d}\n",
+                "{d:>4} | {d:>12} | {d:>11.1} | {d:>9} | {d:>8.2} | {d:>10} | {d:>6} | {d}\n",
                 .{
                     stats.generation,
-                    stats.best,
-                    stats.best_index,
-                    stats.average,
-                    stats.median,
-                    stats.worst,
-                    stats.stddev,
-                    stats.zero_count,
-                    stats.total,
-                    stats.wall_bounces,
+                    stats.best_fitness,
+                    stats.average_fitness,
+                    stats.best_foods,
+                    stats.average_foods,
+                    stats.best_steps,
+                    stats.total_clears,
+                    stats.global_ticks,
                 },
             );
         }
@@ -1692,110 +2226,37 @@ fn printFinalReport(sim: *const Simulation) void {
         const first = sim.stats_log[0];
         const last = sim.stats_log[sim.stats_len - 1];
 
-        var best_avg = sim.stats_log[0];
-        var best_peak = sim.stats_log[0];
-        for (sim.stats_log[1..sim.stats_len]) |stats| {
-            if (stats.average > best_avg.average) best_avg = stats;
-            if (stats.best > best_peak.best) best_peak = stats;
-        }
-
-        const recent_count = @min(sim.stats_len, 10);
-        const recent_start = sim.stats_len - recent_count;
-        var recent_avg_sum: f64 = 0.0;
-        for (sim.stats_log[recent_start..sim.stats_len]) |stats| {
-            recent_avg_sum += stats.average;
-        }
-        const recent_avg = recent_avg_sum /
-            @as(f64, @floatFromInt(recent_count));
-
-        std.debug.print("\n------------------------------ SUMMARY ------------------------------------\n", .{});
         std.debug.print(
-            "first completed : gen {d}  best {d}  avg {d:.3}  median {d:.3}\n",
-            .{ first.generation, first.best, first.average, first.median },
-        );
-        std.debug.print(
-            "last completed  : gen {d}  best {d}  avg {d:.3}  median {d:.3}\n",
-            .{ last.generation, last.best, last.average, last.median },
-        );
-        std.debug.print(
-            "best avg ever   : gen {d}  avg {d:.3}  best {d}\n",
-            .{ best_avg.generation, best_avg.average, best_avg.best },
-        );
-        std.debug.print(
-            "best peak ever  : gen {d}  best {d}  avg {d:.3}\n",
-            .{ best_peak.generation, best_peak.best, best_peak.average },
-        );
-        std.debug.print(
-            "recent {d} avg   : {d:.3}\n",
-            .{ recent_count, recent_avg },
-        );
-        std.debug.print(
-            "avg delta       : {d:.3} food/bird ({d:.3} -> {d:.3})\n",
-            .{ last.average - first.average, first.average, last.average },
-        );
-
-        if (first.average > 0.0) {
-            std.debug.print(
-                "avg ratio       : {d:.3}x of first completed generation\n",
-                .{last.average / first.average},
-            );
-        }
-    }
-
-    std.debug.print("\n------------------------- CURRENT PARTIAL GEN ------------------------------\n", .{});
-    std.debug.print(
-        "generation {d}  age {d}/{d} ({d:.1}%)\n",
-        .{
-            current.generation,
-            current.age,
-            generation_length,
-            @as(f64, @floatFromInt(current.age)) * 100.0 /
-                @as(f64, @floatFromInt(generation_length)),
-        },
-    );
-    std.debug.print(
-        "best {d} (bird {d}) | avg {d:.3} | median {d:.3} | worst {d} | stddev {d:.3} | zero {d}\n",
-        .{
-            current.best,
-            current.best_index,
-            current.average,
-            current.median,
-            current.worst,
-            current.stddev,
-            current.zero_count,
-        },
-    );
-    std.debug.print(
-        "food eaten total {d} | wall bounces {d}\n",
-        .{ current.total, current.wall_bounces },
-    );
-
-    if (current.age > 0) {
-        const scale = @as(f64, @floatFromInt(generation_length)) /
-            @as(f64, @floatFromInt(current.age));
-        std.debug.print(
-            "rough linear pace: best ~{d:.1}, avg ~{d:.1} by tick {d} (diagnostic only)\n",
+            "\nfirst avg food {d:.3} -> last {d:.3} (delta {d:.3})\n",
             .{
-                @as(f64, @floatFromInt(current.best)) * scale,
-                current.average * scale,
-                generation_length,
+                first.average_foods,
+                last.average_foods,
+                last.average_foods - first.average_foods,
+            },
+        );
+
+        std.debug.print(
+            "best-ever fitness {d} | best-ever food/genome {d}\n",
+            .{
+                sim.best_ever_fitness,
+                sim.best_ever_foods,
             },
         );
     }
 
-    const brain_diag = sim.brainDiagnostics();
     std.debug.print(
-        "brain now: output mean {d:.2}/{d:.2}, edge-control {d}/{d} birds, mean speed {d:.6}\n",
+        "\ncurrent partial gen {d}: best fitness {d}, avg {d:.1}, best food {d}, avg food {d:.2}\n",
         .{
-            brain_diag.output0_mean,
-            brain_diag.output1_mean,
-            brain_diag.output0_edge_count,
-            brain_diag.output1_edge_count,
-            brain_diag.speed_mean,
+            sim.generation,
+            current.best_fitness,
+            current.average_fitness,
+            current.best_foods,
+            current.average_foods,
         },
     );
+
     std.debug.print(
-        "===========================================================================\n",
+        "=================================================================\n",
         .{},
     );
 }
@@ -1827,7 +2288,7 @@ pub fn main(
     }
 
     var prng: std.Random.DefaultPrng =
-        .init(0x5348_4f52_454c_4152);
+        .init(0x534e_414b_455f_4249);
 
     const random = prng.random();
 
@@ -1869,7 +2330,7 @@ pub fn main(
         }
 
         for (0..mode.ticksPerFrame()) |_| {
-            _ = sim.step(random);
+            _ = try sim.step(io, random);
         }
 
         render(
