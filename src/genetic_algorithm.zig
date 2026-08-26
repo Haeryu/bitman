@@ -122,9 +122,8 @@ fn uniformCrossover(
             }
         }
 
-        const child_w_scale = BitLinear.wScale(f32, floats, 1e-5);
-
-        const child_gain = 1.0 / child_w_scale;
+        const eps: f32 = 1e-5;
+        const child_gain = @max(BitLinear.absMean(f32, floats), eps);
 
         child.quantizeFromGain(floats, child_gain);
     }

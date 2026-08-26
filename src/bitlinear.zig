@@ -297,7 +297,7 @@ pub const BitLinear = struct {
         return @Vector(std.simd.suggestVectorLength(T).?, T);
     }
 
-    fn absMean(comptime T: type, input: []const T) T {
+    pub fn absMean(comptime T: type, input: []const T) T {
         std.debug.assert(input.len != 0);
 
         const vec_len = std.simd.suggestVectorLength(T).?;
