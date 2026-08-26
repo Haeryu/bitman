@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const activation_vec_len = @min(std.simd.suggestVectorLength(i8).?, 32);
+pub const activation_vec_len = @min(std.simd.suggestVectorLength(i8).?, 32);
 const wide_vec_len = @min(std.simd.suggestVectorLength(i16).?, activation_vec_len);
 const accum_vec_len = @min(std.simd.suggestVectorLength(i32).?, wide_vec_len);
 const wide_chunk_count = activation_vec_len / wide_vec_len;
@@ -12,8 +12,8 @@ const AccumVector = @Vector(accum_vec_len, i32);
 const packed_groups = 4;
 const weights_per_block = packed_groups * activation_vec_len;
 
-const PackedBlock = [activation_vec_len]u8;
-const PackedVector = @Vector(activation_vec_len, u8);
+pub const PackedBlock = [activation_vec_len]u8;
+pub const PackedVector = @Vector(activation_vec_len, u8);
 const PackedShiftVector = @Vector(activation_vec_len, u3);
 
 const max_blocks_per_accum = std.math.maxInt(i16) / (packed_groups * 128);
@@ -68,6 +68,25 @@ pub const BitLinear = struct {
                 pak.* = ternary_bytes[random.uintLessThan(usize, ternary_bytes.len)];
             }
         }
+
+        return .{
+            .weights = weights,
+            .rows = rows,
+            .cols = cols,
+            .weights_gain = 1.0,
+        };
+    }
+
+    pub fn initUndefined(
+        allocator: std.mem.Allocator,
+        rows: usize,
+        cols: usize,
+    ) !BitLinear {
+        std.debug.assert(rows != 0);
+        std.debug.assert(cols != 0);
+
+        const blocks_per_row = (cols + weights_per_block - 1) / weights_per_block;
+        const weights = try allocator.alloc(PackedBlock, rows * blocks_per_row);
 
         return .{
             .weights = weights,
@@ -142,6 +161,77 @@ pub const BitLinear = struct {
 
         // const requant_gain = @as(f32, @floatFromInt(max_abs)) / 127.0;
         // return requant_gain;
+    }
+
+    pub fn dequantizeInto(self: *const BitLinear, out: []f32) void {
+        std.debug.assert(out.len == self.rows * self.cols);
+
+        const blocks_per_row = (self.cols + weights_per_block - 1) / weights_per_block;
+
+        for (0..self.rows) |row| {
+            const w_row = self.weights[row * blocks_per_row ..][0..blocks_per_row];
+
+            for (0..self.cols) |col| {
+                const block_index = col / weights_per_block;
+                const index = col % weights_per_block;
+
+                const q = packedWeightAt(w_row[block_index], index);
+
+                out[row * self.cols + col] = @as(f32, @floatFromInt(q)) *
+                    self.weights_gain;
+            }
+        }
+    }
+
+    pub fn quantizeFrom(self: *BitLinear, input: []const f32) void {
+        std.debug.assert(input.len == self.rows * self.cols);
+
+        const eps: f32 = 1e-5;
+
+        const gain = @max(absMean(f32, input), eps);
+        const inv_gain = 1.0 / gain;
+
+        self.weights_gain = inv_gain;
+    }
+
+    fn Vector(comptime T: type) type {
+        return @Vector(std.simd.suggestVectorLength(T).?, T);
+    }
+
+    fn absMean(comptime T: type, input: []const T) T {
+        std.debug.assert(input.len != 0);
+
+        const vec_len = std.simd.suggestVectorLength(T).?;
+
+        var sumes: [unroll_vec_count]Vector(T) = @splat(@splat(0));
+        var start: usize = 0;
+        while (vec_len * unroll_vec_count <=
+            input.len - start) : (start += vec_len * unroll_vec_count)
+        {
+            inline for (0..unroll_vec_count) |i| {
+                const in_vec: Vector(T) = input[start + i * vec_len ..][0..vec_len].*;
+                sumes[i] += @abs(in_vec);
+            }
+        }
+
+        var sum_scalar: T = 0;
+        inline for (0..unroll_vec_count) |i| {
+            sum_scalar += @reduce(.Add, sumes[i]);
+        }
+
+        var sum: Vector(T) = @splat(0);
+        while (vec_len <= input.len - start) : (start += vec_len) {
+            const in_vec: Vector(T) = input[start..][0..vec_len].*;
+            sum += @abs(in_vec);
+        }
+
+        sum_scalar += @reduce(.Add, sum);
+
+        for (input[start..]) |e| {
+            sum_scalar += @abs(e);
+        }
+
+        return sum_scalar / @as(T, @floatFromInt(input.len));
     }
 
     inline fn unpackGroup(pack: PackedBlock, comptime group: usize) ActivationVector {

@@ -9,20 +9,26 @@ const activation_pfns = @import("activation.zig").activation_pfns;
 pub const PerThreadBuffer = struct {
     outs: []i32,
     activations: []i8,
+    dequant: []f32,
 
-    pub fn init(allocator: std.mem.Allocator, max_length: usize) !PerThreadBuffer {
-        const outs = try allocator.alloc(i32, max_length);
+    pub fn init(allocator: std.mem.Allocator, max_row_col_len: usize, max_element_len: usize) !PerThreadBuffer {
+        const outs = try allocator.alloc(i32, max_row_col_len);
         errdefer allocator.free(outs);
 
-        const activations = try allocator.alloc(i8, max_length);
+        const activations = try allocator.alloc(i8, max_row_col_len);
+        errdefer allocator.free(activations);
+
+        const dequant = try allocator.alloc(f32, max_element_len);
 
         return .{
             .outs = outs,
             .activations = activations,
+            .dequant = dequant,
         };
     }
 
     pub fn deinit(self: *PerThreadBuffer, allocator: std.mem.Allocator) void {
+        allocator.free(self.dequant);
         allocator.free(self.activations);
         allocator.free(self.outs);
 
@@ -41,13 +47,21 @@ pub const LayerSetting = struct {
     cols: usize,
 };
 
+pub const InitMethods = enum {
+    empty,
+    random,
+};
+
 layers: []Bitlinear,
 activation_pfn_index: usize,
+out: []i8,
+fitness: u64,
 
 pub fn init(
     allocator: std.mem.Allocator,
     random: std.Random,
     layer_settings: []const LayerSetting,
+    comptime init_method: InitMethods,
 ) !Individual {
     for (layer_settings[0 .. layer_settings.len - 1], 0..) |setting, i| {
         std.debug.assert(setting.rows == layer_settings[i + 1].cols);
@@ -63,19 +77,28 @@ pub fn init(
     }
 
     for (layer_settings, layers) |layer_setting, *layer| {
-        layer.* = try .initRandom(allocator, random, layer_setting.rows, layer_setting.cols);
+        layer.* = switch (comptime init_method) {
+            .random => try .initRandom(allocator, random, layer_setting.rows, layer_setting.cols),
+            .empty => try .initUndefined(allocator, layer_setting.rows, layer_setting.cols),
+        };
         layers_init_count += 1;
     }
+
+    const out = try allocator.alloc(i8, layers[layers.len - 1].rows);
 
     const activation_pfn_index = random.uintLessThan(usize, activation_pfns.len);
 
     return .{
         .layers = layers,
         .activation_pfn_index = activation_pfn_index,
+        .out = out,
+        .fitness = 0,
     };
 }
 
 pub fn deinit(self: *Individual, allocator: std.mem.Allocator) void {
+    allocator.free(self.out);
+
     for (self.layers) |*layer| {
         layer.deinit(allocator);
     }
@@ -84,7 +107,7 @@ pub fn deinit(self: *Individual, allocator: std.mem.Allocator) void {
     self.* = undefined;
 }
 
-pub fn maxLength(self: *const Individual) usize {
+pub fn maxRowColLen(self: *const Individual) usize {
     var max: usize = 0;
 
     for (self.layers) |layer| {
@@ -94,10 +117,17 @@ pub fn maxLength(self: *const Individual) usize {
     return max;
 }
 
-pub fn forward(
-    self: *const Individual,
-    per_thread_buffer: *PerThreadBuffer,
-) []const i8 {
+pub fn maxElementsLen(self: *const Individual) usize {
+    var max: usize = 0;
+
+    for (self.layers) |layer| {
+        max = @max(max, layer.rows * layer.cols);
+    }
+
+    return max;
+}
+
+pub fn forward(self: *Individual, per_thread_buffer: *PerThreadBuffer) void {
     const activationPFN = activation_pfns[self.activation_pfn_index];
     for (self.layers) |*layer| {
         const input = per_thread_buffer.activations[0..layer.cols];
@@ -109,5 +139,5 @@ pub fn forward(
         requantize(out, per_thread_buffer.activations[0..layer.rows]);
     }
 
-    return per_thread_buffer.activations[0..self.layers[self.layers.len - 1].rows];
+    @memcpy(self.out, per_thread_buffer.activations[0..self.layers[self.layers.len - 1].rows]);
 }

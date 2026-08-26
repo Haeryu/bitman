@@ -20,10 +20,19 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    var individual: Individual = try .init(gpa, random, &layer_settings);
-    defer individual.deinit(gpa);
+    var indi0: Individual = try .init(gpa, random, &layer_settings, .random);
+    defer indi0.deinit(gpa);
 
-    var buffer: Individual.PerThreadBuffer = try .init(gpa, individual.maxLength());
+    var indi1: Individual = try .init(gpa, random, &layer_settings, .random);
+    defer indi1.deinit(gpa);
+
+    var child0: Individual = try .init(gpa, random, &layer_settings, .empty);
+    defer child0.deinit(gpa);
+
+    var child1: Individual = try .init(gpa, random, &layer_settings, .empty);
+    defer child1.deinit(gpa);
+
+    var buffer: Individual.PerThreadBuffer = try .init(gpa, indi0.maxRowColLen(), indi0.maxElementsLen());
     defer buffer.deinit(gpa);
 
     var input: [128]i8 = undefined;
@@ -31,7 +40,33 @@ pub fn main(init: std.process.Init) !void {
 
     buffer.loadInput(&input);
 
-    const out = individual.forward(&buffer);
+    indi0.forward(&buffer);
+    indi0.fitness = 10;
+    indi1.forward(&buffer);
+    indi1.fitness = 20;
 
-    std.debug.print("output = {any}\n", .{out});
+    var childs = [_]Individual{ child0, child1 };
+
+    bitman.genetic_algorithm.evolve(
+        random,
+        &.{ indi0, indi1 },
+        &childs,
+        &buffer,
+        .roulette_wheel,
+        .uniform_crossover,
+        .{ .gaussian_mutation = .{ .chance = 0.1, .coeff = 0.2 } },
+    );
+
+    child0.forward(&buffer);
+    child1.forward(&buffer);
+
+    std.debug.print("weights = {any}\n", .{indi0.layers[0].weights});
+    std.debug.print("weights = {any}\n", .{indi1.layers[0].weights});
+    std.debug.print("weights = {any}\n", .{child0.layers[0].weights});
+    std.debug.print("weights = {any}\n", .{child1.layers[0].weights});
+
+    std.debug.print("output = {any}\n", .{indi0.out});
+    std.debug.print("output = {any}\n", .{indi1.out});
+    std.debug.print("output = {any}\n", .{child0.out});
+    std.debug.print("output = {any}\n", .{child1.out});
 }
