@@ -95,6 +95,7 @@ pub const BitLinear = struct {
             .rows = rows,
             .cols = cols,
             .weights_gain = 1.0,
+            .activation_gain = 1.0,
         };
     }
 
