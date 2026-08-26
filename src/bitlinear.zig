@@ -184,11 +184,25 @@ pub const BitLinear = struct {
     }
 
     pub fn quantizeFrom(self: *BitLinear, input: []const f32) void {
+        self.quantizeFromGain(input, self.weights_gain);
+    }
+
+    pub fn quantizeFromGain(
+        self: *BitLinear,
+        input: []const f32,
+        gain: f32,
+    ) void {
         std.debug.assert(input.len == self.rows * self.cols);
+        std.debug.assert(std.math.isFinite(gain));
+        std.debug.assert(gain >= 0.0);
 
         const eps: f32 = 1e-5;
-        const gain = @max(self.weights_gain, eps);
-        const w_scale = 1.0 / @max(absMean(f32, input), eps);
+        const safe_gain = @max(gain, eps);
+
+        // alpha = gain
+        // Wq = round(W / alpha)
+        const w_scale = 1.0 / safe_gain;
+
         const blocks_per_row = (self.cols + weights_per_block - 1) / weights_per_block;
 
         std.debug.assert(self.weights.len == self.rows * blocks_per_row);
@@ -201,7 +215,23 @@ pub const BitLinear = struct {
             wQuant(f32, w_scale, input_row, output_row);
         }
 
-        self.weights_gain = gain;
+        self.weights_gain = safe_gain;
+    }
+
+    pub inline fn weightAt(
+        self: *const BitLinear,
+        row: usize,
+        col: usize,
+    ) i8 {
+        std.debug.assert(row < self.rows);
+        std.debug.assert(col < self.cols);
+
+        const blocks_per_row = (self.cols + weights_per_block - 1) / weights_per_block;
+        const block_index = col / weights_per_block;
+        const index = col % weights_per_block;
+        const block = self.weights[row * blocks_per_row + block_index];
+
+        return packedWeightAt(block, index);
     }
 
     fn wQuant(

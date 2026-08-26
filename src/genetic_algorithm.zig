@@ -57,6 +57,7 @@ pub fn evolve(
                     &individuals[index_p0],
                     &individuals[index_p1],
                     child,
+                    per_thread_buffer,
                 );
             },
         }
@@ -97,41 +98,35 @@ fn uniformCrossover(
     parent0: *const Individual,
     parent1: *const Individual,
     out_child: *Individual,
+    buffer: *PerThreadBuffer,
 ) void {
-    std.debug.assert(parent0.layers.len == parent1.layers.len);
-    std.debug.assert(parent0.layers.len == out_child.layers.len);
+    for (parent0.layers, parent1.layers, out_child.layers) |*p0, *p1, *child| {
+        const floats = buffer.dequant[0 .. child.rows * child.cols];
+        var abs_sum: f64 = 0;
+        var nonzero_count: usize = 0;
 
-    const RandomInt = @Int(.unsigned, activation_vec_len);
+        for (0..child.rows) |row| {
+            for (0..child.cols) |col| {
+                const use_p0 = random.boolean();
+                const parent = if (use_p0) p0 else p1;
+                const q = parent.weightAt(row, col);
+                const value = @as(f32, @floatFromInt(q)) * parent.weights_gain;
 
-    const BoolVector = @Vector(activation_vec_len, bool);
+                floats[row * child.cols + col] = value;
 
-    for (parent0.layers, parent1.layers, out_child.layers) |*p0_l, *p1_l, *oc_l| {
-        std.debug.assert(p0_l.weights.len == p1_l.weights.len);
-        std.debug.assert(p0_l.weights.len == oc_l.weights.len);
-
-        for (p0_l.weights, p1_l.weights, oc_l.weights) |p0_w, p1_w, *oc_w| {
-            const p0: PackedVector = @bitCast(p0_w);
-            const p1: PackedVector = @bitCast(p1_w);
-
-            var result: PackedVector = @splat(0);
-
-            inline for (0..packed_groups) |group| {
-                const choices: BoolVector = @bitCast(random.int(RandomInt));
-
-                const shift: u3 = @intCast(group * 2);
-
-                const mask: PackedVector = @splat(@as(u8, 0b11) << shift);
-
-                const p0_gene = p0 & mask;
-                const p1_gene = p1 & mask;
-
-                result |= @select(u8, choices, p0_gene, p1_gene);
+                if (q != 0) {
+                    abs_sum += @abs(value);
+                    nonzero_count += 1;
+                }
             }
-
-            oc_w.* = @bitCast(result);
         }
 
-        oc_l.weights_gain = (p0_l.weights_gain + p1_l.weights_gain) * 0.5;
+        const child_gain: f32 = if (nonzero_count != 0)
+            @floatCast(abs_sum / @as(f64, @floatFromInt(nonzero_count)))
+        else
+            (p0.weights_gain + p1.weights_gain) * 0.5;
+
+        child.quantizeFromGain(floats, child_gain);
     }
 
     out_child.activation_pfn_index = if (random.boolean())
@@ -156,7 +151,7 @@ fn gaussianMutation(
             if (random.float(f32) < chance) {
                 const sign: f32 = if (random.boolean()) -1.0 else 1.0;
 
-                gene.* += sign * coeff * random.float(f32);
+                gene.* += sign * coeff * layer.weights_gain * random.float(f32);
             }
         }
 
