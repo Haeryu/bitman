@@ -395,11 +395,17 @@ const WinConsole = struct {
 //   - brains survive through the genome only
 // ============================================================
 
-const population_size = 128;
+const population_size = 48;
 const food_count = 60;
 
 const generations = 500;
 const generation_length = 2500;
+
+// Every genome is evaluated independently on the SAME four training
+// episode seeds for a generation.  The seeds change next generation,
+// so genomes cannot win by sharing/stealing food or by memorizing one
+// permanent layout.
+const train_world_count = 4;
 
 // The champion from each training generation is evaluated again on
 // the exact same fixed-seed worlds. These scores NEVER participate
@@ -423,7 +429,7 @@ const eval_seeds = [_]u64{
 // The simulation itself still runs every tick.
 const preview_every = 10;
 const preview_stride = 10;
-const preview_delay_ms = 30;
+const preview_delay_ms = 5;
 
 // Eye settings from Shorelark.
 const eye_cells = 9;
@@ -497,8 +503,9 @@ const Creature = struct {
 const PopulationStats = struct {
     best_index: usize,
 
-    best_eaten: usize,
-    total_eaten: usize,
+    // Scores are food-per-episode averages, so train/eval curves use
+    // the same unit even though training uses 4 worlds and eval uses 8.
+    best_eaten: f64,
     average_eaten: f64,
 };
 
@@ -531,18 +538,6 @@ pub fn main(
     const random =
         prng.random();
 
-    // --------------------------------------------------------
-    // Brain
-    //
-    // 9 eye cells
-    //    ->
-    // 18 hidden
-    //    ->
-    // speed / rotation
-    //
-    // 9*18 + 18*2 = 198 ternary genes.
-    // --------------------------------------------------------
-
     const layer_settings =
         [_]Individual.LayerSetting{
             .{
@@ -554,15 +549,6 @@ pub fn main(
                 .rows = 2,
             },
         };
-
-    // Two complete populations.
-    //
-    // parents  -> evaluated generation
-    // children -> evolution destination
-    //
-    // Then swap the slices.
-    //
-    // No population allocation happens in the evolution loop.
 
     const population_a =
         try allocPopulation(
@@ -607,12 +593,6 @@ pub fn main(
     var children: []Individual =
         population_b;
 
-    var creatures: [population_size]Creature =
-        undefined;
-
-    var foods: [food_count]Food =
-        undefined;
-
     var console =
         try WinConsole.init();
 
@@ -626,118 +606,103 @@ pub fn main(
         }
     }
 
-    var best_ever: usize = 0;
-
     var last_stats = PopulationStats{
         .best_index = 0,
-        .best_eaten = 0,
-        .total_eaten = 0,
+        .best_eaten = 0.0,
         .average_eaten = 0.0,
     };
 
     var average_history: [generations]f64 = @splat(0.0);
-    var best_history: [generations]usize = @splat(0);
+    var best_history: [generations]f64 = @splat(0.0);
     var eval_history: [generations]f64 = @splat(0.0);
     var history_len: usize = 0;
 
+    var best_train_ever: f64 = 0.0;
     var last_eval_score: f64 = 0.0;
     var best_eval_ever: f64 = 0.0;
 
     for (0..generations) |generation| {
-        resetCreatures(
-            random,
-            &creatures,
-        );
-
-        resetFoods(
-            random,
-            &foods,
-        );
-
-        const watch =
-            !fast_mode and
-            (generation % preview_every == 0 or
-                generation + 1 == generations);
-
-        runGeneration(
-            io,
-            random,
-            &console,
-            parents,
-            &buffer,
-            &creatures,
-            &foods,
-            generation,
-            best_ever,
-            watch,
-            &average_history,
-            &best_history,
-            &eval_history,
-            history_len,
-        );
+        // ----------------------------------------------------
+        // TRAIN
+        //
+        // Every individual gets its own Creature/Food state.
+        // Every individual receives the same 4 episode seeds.
+        // There is no shared food array and therefore no competition
+        // or population-order effect in the fitness measurement.
+        // ----------------------------------------------------
 
         const stats =
-            scorePopulation(
+            evaluateTrainingPopulation(
                 parents,
-                &creatures,
+                &buffer,
+                generation,
             );
 
-        // Re-evaluate only the TRAINING champion on fixed worlds.
-        // This is intentionally disconnected from fitness/selection.
+        // Fixed eight-world benchmark of this generation's training
+        // champion.  Measurement only; never used for selection.
         const eval_score =
             evaluateChampion(
                 &parents[stats.best_index],
                 &buffer,
             );
 
-        average_history[generation] = stats.average_eaten;
-        best_history[generation] = stats.best_eaten;
-        eval_history[generation] = eval_score;
-        history_len = generation + 1;
+        average_history[generation] =
+            stats.average_eaten;
+
+        best_history[generation] =
+            stats.best_eaten;
+
+        eval_history[generation] =
+            eval_score;
+
+        history_len =
+            generation + 1;
 
         last_stats = stats;
         last_eval_score = eval_score;
-        best_eval_ever = @max(best_eval_ever, eval_score);
 
-        best_ever =
+        best_train_ever =
             @max(
-                best_ever,
+                best_train_ever,
                 stats.best_eaten,
             );
 
-        // Always present at least one final frame for this generation.
-        // In --fast mode this becomes the main progress display.
+        best_eval_ever =
+            @max(
+                best_eval_ever,
+                eval_score,
+            );
 
-        renderTui(
-            &console,
-            parents,
-            &creatures,
-            &foods,
-            generation,
-            generation_length,
-            best_ever,
-            &average_history,
-            &best_history,
-            &eval_history,
-            history_len,
-        );
+        // The TUI is a completely separate replay.  It never changes
+        // fitness.  We watch one champion in one independent preview
+        // world because drawing 128 independent food worlds on one
+        // screen would be misleading.
+        const watch =
+            !fast_mode and
+            (generation % preview_every == 0 or
+                generation + 1 == generations);
 
         if (watch) {
-            io.sleep(
-                .fromMilliseconds(180),
-                .awake,
-            ) catch {};
+            previewChampion(
+                io,
+                &console,
+                &parents[stats.best_index],
+                &buffer,
+                generation,
+                stats,
+                best_train_ever,
+                eval_score,
+                best_eval_ever,
+                &average_history,
+                &best_history,
+                &eval_history,
+                history_len,
+            );
         }
 
-        if (generation + 1 ==
-            generations)
-        {
+        if (generation + 1 == generations) {
             break;
         }
-
-        // ----------------------------------------------------
-        // Reproduce.
-        // ----------------------------------------------------
 
         bitman.genetic_algorithm.evolve(
             random,
@@ -754,25 +719,11 @@ pub fn main(
             },
         );
 
-        // ----------------------------------------------------
-        // One-member elitism.
-        //
-        // The GA itself has no elitism, so preserve the exact
-        // champion genome in child slot 0.
-        //
-        // Physical state is NOT copied.
-        // Position / rotation / speed are randomized when the
-        // next generation begins.
-        // ----------------------------------------------------
-
+        // One-member elitism: exact training champion survives.
         copyGenome(
             &parents[stats.best_index],
             &children[0],
         );
-
-        // ----------------------------------------------------
-        // Reuse both population buffers.
-        // ----------------------------------------------------
 
         const tmp =
             parents;
@@ -795,31 +746,31 @@ pub fn main(
     );
 
     std.debug.print(
-        \\
-        \\================ BITMAN SHORELARK =================
-        \\generations       : {d}
-        \\population        : {d}
-        \\generation ticks  : {d}
-        \\brain             : 9 -> 18 -> 2
-        \\ternary genes     : {d}
-        \\last best eaten   : {d}
-        \\last avg eaten    : {d:.3}
-        \\best ever eaten   : {d}
-        \\eval worlds       : {d} fixed seeds
-        \\last eval champ   : {d:.3}
-        \\best eval champ   : {d:.3}
-        \\mutation          : {d:.2}% / coeff {d:.2}
-        \\===================================================
-        \\
-    ,
+        "\n" ++
+            "================ BITMAN SHORELARK =================\n" ++
+            "generations       : {d}\n" ++
+            "population        : {d}\n" ++
+            "generation ticks  : {d}\n" ++
+            "brain             : 9 -> 18 -> 2\n" ++
+            "ternary genes     : {d}\n" ++
+            "train worlds      : {d} common seeds / generation\n" ++
+            "last train best   : {d:.3}\n" ++
+            "last train avg    : {d:.3}\n" ++
+            "best train ever   : {d:.3}\n" ++
+            "eval worlds       : {d} fixed seeds\n" ++
+            "last eval champ   : {d:.3}\n" ++
+            "best eval champ   : {d:.3}\n" ++
+            "mutation          : {d:.2}% / coeff {d:.2}\n" ++
+            "===================================================\n\n",
         .{
             generations,
             population_size,
             generation_length,
             genomeValueCount(),
+            train_world_count,
             last_stats.best_eaten,
             last_stats.average_eaten,
-            best_ever,
+            best_train_ever,
             eval_world_count,
             last_eval_score,
             best_eval_ever,
@@ -977,49 +928,294 @@ fn randomPosition(
 }
 
 // ============================================================
-// GENERATION
+// INDEPENDENT TRAINING EPISODES
 // ============================================================
 
-fn runGeneration(
-    io: std.Io,
-    random: std.Random,
-    console: *WinConsole,
+fn evaluateTrainingPopulation(
     population: []Individual,
     buffer: *Individual.PerThreadBuffer,
-    creatures: *[population_size]Creature,
-    foods: *[food_count]Food,
     generation: usize,
-    best_ever: usize,
-    watch: bool,
+) PopulationStats {
+    std.debug.assert(
+        population.len == population_size,
+    );
+
+    var best_index: usize = 0;
+    var best_total: usize = 0;
+    var population_total: usize = 0;
+
+    for (population, 0..) |*individual, index| {
+        var individual_total: usize = 0;
+
+        // SAME seeds for every genome in this generation.
+        // Each runEpisode() creates private Creature/Food state.
+        for (0..train_world_count) |world_index| {
+            const eaten =
+                runEpisode(
+                    individual,
+                    buffer,
+                    trainingSeed(
+                        generation,
+                        world_index,
+                    ),
+                );
+
+            individual_total += eaten;
+        }
+
+        // Roulette wheel only cares about relative fitness.  The +1
+        // guarantees a valid total even if generation 0 eats nothing.
+        individual.fitness =
+            1 +
+            @as(
+                u64,
+                @intCast(individual_total),
+            );
+
+        population_total +=
+            individual_total;
+
+        if (individual_total > best_total) {
+            best_total = individual_total;
+            best_index = index;
+        }
+    }
+
+    const denom =
+        @as(
+            f64,
+            @floatFromInt(train_world_count),
+        );
+
+    const population_denom =
+        @as(
+            f64,
+            @floatFromInt(
+                population_size * train_world_count,
+            ),
+        );
+
+    return .{
+        .best_index = best_index,
+        .best_eaten = @as(
+            f64,
+            @floatFromInt(best_total),
+        ) / denom,
+        .average_eaten = @as(
+            f64,
+            @floatFromInt(population_total),
+        ) / population_denom,
+    };
+}
+
+fn runEpisode(
+    individual: *Individual,
+    buffer: *Individual.PerThreadBuffer,
+    seed: u64,
+) usize {
+    var episode_prng: std.Random.DefaultPrng =
+        .init(seed);
+
+    const random =
+        episode_prng.random();
+
+    var creature = Creature{
+        .pos = randomPosition(random),
+        .rotation = random.float(f32) * tau,
+        .speed = speed_initial,
+        .eaten = 0,
+    };
+
+    var foods: [food_count]Food =
+        undefined;
+
+    resetFoods(
+        random,
+        &foods,
+    );
+
+    for (0..generation_length) |_| {
+        const vision =
+            senseAndEat(
+                random,
+                &creature,
+                &foods,
+            );
+
+        _ = individual.forward(
+            &vision,
+            buffer,
+        );
+
+        applyBrain(
+            &creature,
+            individual.out,
+        );
+
+        moveCreature(
+            &creature,
+        );
+    }
+
+    return creature.eaten;
+}
+
+// ------------------------------------------------------------
+// Training seeds
+// ------------------------------------------------------------
+//
+// One generation == one common exam sheet of four worlds.
+// Next generation gets a different exam sheet.
+//
+// splitMix64 gives us deterministic, well-separated seeds without
+// sharing a mutable RNG stream between individuals.
+
+fn trainingSeed(
+    generation: usize,
+    world_index: usize,
+) u64 {
+    const serial =
+        @as(u64, @intCast(generation)) *%
+        @as(u64, train_world_count) +%
+        @as(u64, @intCast(world_index));
+
+    return splitMix64(
+        0x5452_4149_4e00_0000 +% serial,
+    );
+}
+
+fn previewSeed(
+    generation: usize,
+) u64 {
+    return splitMix64(
+        0x5052_4556_4945_5700 +%
+            @as(u64, @intCast(generation)),
+    );
+}
+
+fn splitMix64(
+    input: u64,
+) u64 {
+    var z =
+        input +% 0x9E37_79B9_7F4A_7C15;
+
+    z =
+        (z ^ (z >> 30)) *%
+        0xBF58_476D_1CE4_E5B9;
+
+    z =
+        (z ^ (z >> 27)) *%
+        0x94D0_49BB_1331_11EB;
+
+    return z ^ (z >> 31);
+}
+
+// ============================================================
+// FIXED-SEED CHAMPION EVALUATION
+// ============================================================
+
+fn evaluateChampion(
+    champion: *Individual,
+    buffer: *Individual.PerThreadBuffer,
+) f64 {
+    var total_eaten: usize = 0;
+
+    for (eval_seeds) |seed| {
+        total_eaten +=
+            runEpisode(
+                champion,
+                buffer,
+                seed,
+            );
+    }
+
+    return @as(
+        f64,
+        @floatFromInt(total_eaten),
+    ) / @as(
+        f64,
+        @floatFromInt(eval_world_count),
+    );
+}
+
+// ============================================================
+// CHAMPION PREVIEW -- DISPLAY ONLY
+// ============================================================
+
+fn previewChampion(
+    io: std.Io,
+    console: *WinConsole,
+    champion: *Individual,
+    buffer: *Individual.PerThreadBuffer,
+    generation: usize,
+    train_stats: PopulationStats,
+    best_train_ever: f64,
+    eval_score: f64,
+    best_eval_ever: f64,
     average_history: *const [generations]f64,
-    best_history: *const [generations]usize,
+    best_history: *const [generations]f64,
     eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
+    var preview_prng: std.Random.DefaultPrng =
+        .init(previewSeed(generation));
+
+    const random =
+        preview_prng.random();
+
+    var creature = Creature{
+        .pos = randomPosition(random),
+        .rotation = random.float(f32) * tau,
+        .speed = speed_initial,
+        .eaten = 0,
+    };
+
+    var foods: [food_count]Food =
+        undefined;
+
+    resetFoods(
+        random,
+        &foods,
+    );
+
     for (0..generation_length) |tick| {
-        stepSimulation(
-            random,
-            population,
+        const vision =
+            senseAndEat(
+                random,
+                &creature,
+                &foods,
+            );
+
+        _ = champion.forward(
+            &vision,
             buffer,
-            creatures,
-            foods,
         );
 
-        const age =
-            tick + 1;
+        applyBrain(
+            &creature,
+            champion.out,
+        );
 
-        if (watch and
-            (age % preview_stride == 0 or
-                age == generation_length))
+        moveCreature(
+            &creature,
+        );
+
+        const age = tick + 1;
+
+        if (age % preview_stride == 0 or
+            age == generation_length)
         {
             renderTui(
                 console,
-                population,
-                creatures,
-                foods,
+                champion,
+                &creature,
+                &foods,
                 generation,
                 age,
-                best_ever,
+                train_stats,
+                best_train_ever,
+                eval_score,
+                best_eval_ever,
                 average_history,
                 best_history,
                 eval_history,
@@ -1034,146 +1230,11 @@ fn runGeneration(
             ) catch {};
         }
     }
-}
 
-// ============================================================
-// FIXED-SEED CHAMPION EVALUATION
-// ============================================================
-//
-// The selected training champion is replayed on the same eight
-// deterministic worlds every generation.  Its average score is a
-// measurement only: it never changes fitness and never participates
-// in parent selection.
-//
-// A seed determines the initial creature state, initial food field,
-// and deterministic food-respawn random stream for that evaluation.
-// ============================================================
-
-fn evaluateChampion(
-    champion: *Individual,
-    buffer: *Individual.PerThreadBuffer,
-) f64 {
-    var total_eaten: usize = 0;
-
-    for (eval_seeds) |seed| {
-        var eval_prng: std.Random.DefaultPrng =
-            .init(seed);
-
-        const random =
-            eval_prng.random();
-
-        var creature = Creature{
-            .pos = randomPosition(random),
-            .rotation = random.float(f32) * tau,
-            .speed = speed_initial,
-            .eaten = 0,
-        };
-
-        var foods: [food_count]Food =
-            undefined;
-
-        resetFoods(
-            random,
-            &foods,
-        );
-
-        for (0..generation_length) |_| {
-            const vision =
-                senseAndEat(
-                    random,
-                    &creature,
-                    &foods,
-                );
-
-            _ = champion.forward(
-                &vision,
-                buffer,
-            );
-
-            applyBrain(
-                &creature,
-                champion.out,
-            );
-
-            moveCreature(
-                &creature,
-            );
-        }
-
-        total_eaten +=
-            creature.eaten;
-    }
-
-    return @as(
-        f64,
-        @floatFromInt(total_eaten),
-    ) / @as(
-        f64,
-        @floatFromInt(eval_world_count),
-    );
-}
-
-// ============================================================
-// SIMULATION STEP
-// ============================================================
-//
-// We combine collision detection and vision gathering into one food
-// scan per creature.
-//
-// This keeps the interesting semantics:
-//
-//     food eaten -> food immediately respawns -> organism sees new food
-//
-// while avoiding two O(population * food) passes per tick.
-// ============================================================
-
-fn stepSimulation(
-    random: std.Random,
-    population: []Individual,
-    buffer: *Individual.PerThreadBuffer,
-    creatures: *[population_size]Creature,
-    foods: *[food_count]Food,
-) void {
-    std.debug.assert(
-        population.len ==
-            population_size,
-    );
-
-    // --------------------------------------------------------
-    // Sense -> eat -> think
-    // --------------------------------------------------------
-
-    for (
-        population,
-        creatures,
-    ) |*individual, *creature| {
-        const vision =
-            senseAndEat(
-                random,
-                creature,
-                foods,
-            );
-
-        _ = individual.forward(
-            &vision,
-            buffer,
-        );
-
-        applyBrain(
-            creature,
-            individual.out,
-        );
-    }
-
-    // --------------------------------------------------------
-    // Move
-    // --------------------------------------------------------
-
-    for (creatures) |*creature| {
-        moveCreature(
-            creature,
-        );
-    }
+    io.sleep(
+        .fromMilliseconds(180),
+        .awake,
+    ) catch {};
 }
 
 // ============================================================
@@ -1542,131 +1603,6 @@ fn moveCreature(
 }
 
 // ============================================================
-// FITNESS
-// ============================================================
-
-fn scorePopulation(
-    population: []Individual,
-    creatures: *const [population_size]Creature,
-) PopulationStats {
-    std.debug.assert(
-        population.len ==
-            population_size,
-    );
-
-    var best_index: usize = 0;
-    var best_eaten: usize = 0;
-    var total_eaten: usize = 0;
-
-    for (
-        population,
-        creatures,
-        0..,
-    ) |*individual, creature, index| {
-        // Roulette wheel requires total fitness > 0.
-        //
-        // Adding one leaves the objective essentially:
-        //
-        //     eat as much food as possible
-        //
-        // but allows an all-zero first generation.
-
-        individual.fitness =
-            1 +
-            @as(
-                u64,
-                @intCast(
-                    creature.eaten,
-                ),
-            );
-
-        total_eaten +=
-            creature.eaten;
-
-        if (creature.eaten >
-            best_eaten)
-        {
-            best_eaten =
-                creature.eaten;
-
-            best_index =
-                index;
-        }
-    }
-
-    const average =
-        @as(
-            f64,
-            @floatFromInt(
-                total_eaten,
-            ),
-        ) /
-        @as(
-            f64,
-            @floatFromInt(
-                population_size,
-            ),
-        );
-
-    return .{
-        .best_index = best_index,
-
-        .best_eaten = best_eaten,
-
-        .total_eaten = total_eaten,
-
-        .average_eaten = average,
-    };
-}
-
-fn liveStats(
-    creatures: *const [population_size]Creature,
-) PopulationStats {
-    var best_index: usize = 0;
-    var best_eaten: usize = 0;
-    var total_eaten: usize = 0;
-
-    for (
-        creatures,
-        0..,
-    ) |creature, index| {
-        total_eaten +=
-            creature.eaten;
-
-        if (creature.eaten >
-            best_eaten)
-        {
-            best_eaten =
-                creature.eaten;
-
-            best_index =
-                index;
-        }
-    }
-
-    return .{
-        .best_index = best_index,
-
-        .best_eaten = best_eaten,
-
-        .total_eaten = total_eaten,
-
-        .average_eaten = @as(
-            f64,
-            @floatFromInt(
-                total_eaten,
-            ),
-        ) /
-            @as(
-                f64,
-                @floatFromInt(
-                    population_size,
-                ),
-            ),
-    };
-}
-
-// ============================================================
 // TOROIDAL WORLD HELPERS
 // ============================================================
 
@@ -1727,14 +1663,17 @@ fn wrapAngle(
 
 fn renderTui(
     console: *WinConsole,
-    population: []const Individual,
-    creatures: *const [population_size]Creature,
+    champion: *const Individual,
+    creature: *const Creature,
     foods: *const [food_count]Food,
     generation: usize,
     age: usize,
-    best_ever: usize,
+    train_stats: PopulationStats,
+    best_train_ever: f64,
+    eval_score: f64,
+    best_eval_ever: f64,
     average_history: *const [generations]f64,
-    best_history: *const [generations]usize,
+    best_history: *const [generations]f64,
     eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
@@ -1746,33 +1685,16 @@ fn renderTui(
     const attr =
         console.attributes;
 
-    const stats =
-        liveStats(
-            creatures,
-        );
-
-    const leader_index =
-        stats.best_index;
-
-    const leader =
-        &creatures[
-            leader_index
-        ];
-
-    const leader_vision =
+    const vision =
         makeVision(
-            leader,
+            creature,
             foods,
         );
-
-    // --------------------------------------------------------
-    // Header
-    // --------------------------------------------------------
 
     frame.write(
         0,
         0,
-        "BITMAN SHORELARK | eye -> ternary brain -> eat -> reproduce",
+        "BITMAN SHORELARK | independent episodes | champion preview",
         attr,
     );
 
@@ -1780,7 +1702,7 @@ fn renderTui(
         0,
         1,
         attr,
-        "generation {d:>3}/{d:<3}   age {d:>4}/{d:<4}   population {d}   food {d}",
+        "generation {d:>3}/{d:<3}   preview age {d:>4}/{d:<4}   population {d}   food {d}",
         .{
             generation,
             generations - 1,
@@ -1795,12 +1717,12 @@ fn renderTui(
         0,
         2,
         attr,
-        "eaten: best {d:<5} avg {d:<8.3} total {d:<7} best-ever {d}",
+        "train: best {d:<8.3} avg {d:<8.3} best-ever {d:<8.3}   worlds/genome {d}",
         .{
-            stats.best_eaten,
-            stats.average_eaten,
-            stats.total_eaten,
-            best_ever,
+            train_stats.best_eaten,
+            train_stats.average_eaten,
+            best_train_ever,
+            train_world_count,
         },
     );
 
@@ -1808,12 +1730,11 @@ fn renderTui(
         0,
         3,
         attr,
-        "brain 9->18->2   genes {d}   mutation {d:.2}% coeff {d:.2}   elite 1",
+        "fixed eval: champion {d:<8.3} best-ever {d:<8.3}   eval worlds {d}",
         .{
-            genomeValueCount(),
-            mutation_chance *
-                100.0,
-            mutation_coeff,
+            eval_score,
+            best_eval_ever,
+            eval_world_count,
         },
     );
 
@@ -1821,90 +1742,61 @@ fn renderTui(
         0,
         4,
         attr,
-        "eye: range {d:.2}   angle {d:.1} deg   cells {d}   fitness = 1 + food eaten",
+        "brain 9->18->2   genes {d}   mutation {d:.2}% coeff {d:.2}   elite 1",
         .{
-            fov_range,
-            fov_angle *
-                180.0 /
-                pi,
-            eye_cells,
+            genomeValueCount(),
+            mutation_chance * 100.0,
+            mutation_coeff,
         },
     );
-
-    // --------------------------------------------------------
-    // Leader eye.
-    // --------------------------------------------------------
 
     var eye_chars: [eye_cells]u8 =
         undefined;
 
-    for (
-        leader_vision,
-        0..,
-    ) |value, i| {
+    for (vision, 0..) |value, i| {
         eye_chars[i] =
-            visionChar(
-                value,
-            );
+            visionChar(value);
     }
 
     frame.write(
         0,
         5,
-        "leader eye [",
+        "champ eye [",
         attr,
     );
 
     frame.write(
-        12,
+        11,
         5,
         eye_chars[0..],
         attr,
     );
 
     frame.write(
-        21,
+        20,
         5,
         "]",
         attr,
     );
 
-    if (age > 0 and
-        population.len >
-            leader_index)
-    {
-        const out =
-            population[
-                leader_index
-            ].out;
-
-        if (out.len >= 2) {
-            frame.writeFmt(
-                25,
-                5,
-                attr,
-                "brain speed={d:>4} turn={d:>4}",
-                .{
-                    out[0],
-                    out[1],
-                },
-            );
-        }
+    if (champion.out.len >= 2) {
+        frame.writeFmt(
+            24,
+            5,
+            attr,
+            "brain speed={d:>4} turn={d:>4}   preview eaten={d}",
+            .{
+                champion.out[0],
+                champion.out[1],
+                creature.eaten,
+            },
+        );
     }
-
-    // --------------------------------------------------------
-    // Grid border
-    // --------------------------------------------------------
 
     const grid_x: usize = 1;
     const grid_y: usize = 8;
 
-    frame.put(
-        grid_x,
-        grid_y,
-        '+',
-        attr,
-    );
+    frame.put(grid_x, grid_y, '+', attr);
 
     for (0..grid_width) |x| {
         frame.put(
@@ -1916,19 +1808,14 @@ fn renderTui(
     }
 
     frame.put(
-        grid_x +
-            grid_width +
-            1,
+        grid_x + grid_width + 1,
         grid_y,
         '+',
         attr,
     );
 
     for (0..grid_height) |y| {
-        const row =
-            grid_y +
-            1 +
-            y;
+        const row = grid_y + 1 + y;
 
         frame.put(
             grid_x,
@@ -1938,9 +1825,7 @@ fn renderTui(
         );
 
         frame.put(
-            grid_x +
-                grid_width +
-                1,
+            grid_x + grid_width + 1,
             row,
             '|',
             attr,
@@ -1948,9 +1833,7 @@ fn renderTui(
     }
 
     const bottom =
-        grid_y +
-        grid_height +
-        1;
+        grid_y + grid_height + 1;
 
     frame.put(
         grid_x,
@@ -1969,23 +1852,15 @@ fn renderTui(
     }
 
     frame.put(
-        grid_x +
-            grid_width +
-            1,
+        grid_x + grid_width + 1,
         bottom,
         '+',
         attr,
     );
 
-    // --------------------------------------------------------
-    // Foods first.
-    // --------------------------------------------------------
-
     for (foods) |food| {
         const gx, const gy =
-            worldToGrid(
-                food.pos,
-            );
+            worldToGrid(food.pos);
 
         frame.put(
             grid_x + 1 + gx,
@@ -1995,165 +1870,55 @@ fn renderTui(
         );
     }
 
-    // --------------------------------------------------------
-    // Organisms.
-    //
-    // Ordinary creature = o
-    // Current leader    = direction arrow
-    // --------------------------------------------------------
+    const gx, const gy =
+        worldToGrid(creature.pos);
 
-    for (
-        creatures,
-        0..,
-    ) |creature, index| {
-        const gx, const gy =
-            worldToGrid(
-                creature.pos,
-            );
-
-        const symbol =
-            if (index ==
-            leader_index)
-                directionChar(
-                    creature.rotation,
-                )
-            else
-                'o';
-
-        frame.put(
-            grid_x + 1 + gx,
-            grid_y + 1 + gy,
-            symbol,
-            attr,
-        );
-    }
-
-    // --------------------------------------------------------
-    // Right panel
-    // --------------------------------------------------------
+    frame.put(
+        grid_x + 1 + gx,
+        grid_y + 1 + gy,
+        directionChar(creature.rotation),
+        attr,
+    );
 
     const panel_x: usize = 86;
 
-    frame.write(
-        panel_x,
-        9,
-        "* food",
-        attr,
-    );
-
-    frame.write(
-        panel_x,
-        10,
-        "o organism",
-        attr,
-    );
-
-    frame.write(
-        panel_x,
-        11,
-        "^ leader",
-        attr,
-    );
-
-    frame.write(
-        panel_x,
-        13,
-        "LEADER",
-        attr,
-    );
-
-    frame.writeFmt(
-        panel_x,
-        14,
-        attr,
-        "index  {d}",
-        .{
-            leader_index,
-        },
-    );
+    frame.write(panel_x, 9, "* food", attr);
+    frame.write(panel_x, 10, "^ champion", attr);
+    frame.write(panel_x, 12, "PREVIEW ONLY", attr);
+    frame.write(panel_x, 13, "not fitness", attr);
 
     frame.writeFmt(
         panel_x,
         15,
         attr,
-        "eaten  {d}",
-        .{
-            leader.eaten,
-        },
+        "eaten {d}",
+        .{creature.eaten},
     );
 
     frame.writeFmt(
         panel_x,
         16,
         attr,
-        "speed  {d:.5}",
-        .{
-            leader.speed,
-        },
+        "speed {d:.5}",
+        .{creature.speed},
     );
 
     frame.writeFmt(
         panel_x,
         17,
         attr,
-        "angle  {d:.1}",
-        .{
-            angleDegrees(
-                leader.rotation,
-            ),
-        },
+        "angle {d:.1}",
+        .{angleDegrees(creature.rotation)},
     );
 
-    frame.write(
-        panel_x,
-        19,
-        "EYE",
-        attr,
-    );
+    frame.write(panel_x, 19, "EYE", attr);
+    frame.write(panel_x, 20, "[", attr);
+    frame.write(panel_x + 1, 20, eye_chars[0..], attr);
+    frame.write(panel_x + 1 + eye_cells, 20, "]", attr);
 
-    frame.write(
-        panel_x,
-        20,
-        "[",
-        attr,
-    );
-
-    frame.write(
-        panel_x + 1,
-        20,
-        eye_chars[0..],
-        attr,
-    );
-
-    frame.write(
-        panel_x +
-            1 +
-            eye_cells,
-        20,
-        "]",
-        attr,
-    );
-
-    frame.write(
-        panel_x,
-        22,
-        " . far",
-        attr,
-    );
-
-    frame.write(
-        panel_x,
-        23,
-        " + near",
-        attr,
-    );
-
-    frame.write(
-        panel_x,
-        24,
-        " # close",
-        attr,
-    );
+    frame.write(panel_x, 22, "4 train worlds", attr);
+    frame.write(panel_x, 23, "private state", attr);
+    frame.write(panel_x, 24, "same seeds/gen", attr);
 
     drawLearningCurve(
         &frame,
@@ -2166,9 +1931,7 @@ fn renderTui(
         history_len,
     );
 
-    console.present(
-        &frame,
-    );
+    console.present(&frame);
 }
 
 fn worldToGrid(
@@ -2291,7 +2054,7 @@ fn drawLearningCurve(
     y: usize,
     attr: WORD,
     average_history: *const [generations]f64,
-    best_history: *const [generations]usize,
+    best_history: *const [generations]f64,
     eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
@@ -2299,7 +2062,7 @@ fn drawLearningCurve(
     const graph_height = 8;
 
     frame.write(x, y, "LEARNING CURVE", attr);
-    frame.write(x, y + 1, "@eval #best .avg", attr);
+    frame.write(x, y + 1, "@eval #train .avg", attr);
 
     if (history_len == 0) {
         frame.write(x, y + 3, "waiting for gen 0...", attr);
@@ -2309,10 +2072,7 @@ fn drawLearningCurve(
     var max_value: f64 = 1.0;
 
     for (best_history.*[0..history_len]) |value| {
-        max_value = @max(
-            max_value,
-            @as(f64, @floatFromInt(value)),
-        );
+        max_value = @max(max_value, value);
     }
 
     for (eval_history.*[0..history_len]) |value| {
@@ -2343,10 +2103,7 @@ fn drawLearningCurve(
         );
 
         const best_normalized = std.math.clamp(
-            @as(
-                f64,
-                @floatFromInt(best_history.*[history_index]),
-            ) / max_value,
+            best_history.*[history_index] / max_value,
             0.0,
             1.0,
         );
@@ -2427,7 +2184,7 @@ fn curveRow(
 
 fn printLearningCurve(
     average_history: *const [generations]f64,
-    best_history: *const [generations]usize,
+    best_history: *const [generations]f64,
     eval_history: *const [generations]f64,
     history_len: usize,
 ) void {
@@ -2441,10 +2198,7 @@ fn printLearningCurve(
     var max_value: f64 = 1.0;
 
     for (best_history.*[0..history_len]) |value| {
-        max_value = @max(
-            max_value,
-            @as(f64, @floatFromInt(value)),
-        );
+        max_value = @max(max_value, value);
     }
 
     for (eval_history.*[0..history_len]) |value| {
@@ -2470,10 +2224,7 @@ fn printLearningCurve(
         );
 
         const best = std.math.clamp(
-            @as(
-                f64,
-                @floatFromInt(best_history.*[index]),
-            ) / max_value,
+            best_history.*[index] / max_value,
             0.0,
             1.0,
         );
@@ -2508,7 +2259,7 @@ fn printLearningCurve(
     }
 
     std.debug.print(
-        "\nLEARNING CURVE   @ fixed-seed eval   # train best   . train average\n",
+        "\nLEARNING CURVE   @ fixed-seed eval   # train best(avg/4)   . population avg\n",
         .{},
     );
 
