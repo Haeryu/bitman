@@ -103,8 +103,6 @@ fn uniformCrossover(
 ) void {
     for (parent0.layers, parent1.layers, out_child.layers) |*p0, *p1, *child| {
         const floats = buffer.dequant[0 .. child.rows * child.cols];
-        var abs_sum: f64 = 0;
-        var nonzero_count: usize = 0;
 
         for (0..child.rows) |row| {
             for (0..child.cols) |col| {
@@ -114,11 +112,6 @@ fn uniformCrossover(
                 const value = @as(f32, @floatFromInt(q)) * parent.weights_gain;
 
                 floats[row * child.cols + col] = value;
-
-                if (q != 0) {
-                    abs_sum += @abs(value);
-                    nonzero_count += 1;
-                }
             }
         }
 

@@ -49,7 +49,8 @@ pub const BitLinear = struct {
     rows: usize,
     cols: usize,
 
-    weights_gain: f32 = 1.0,
+    weights_gain: f32,
+    activation_gain: f32,
 
     pub fn initRandom(
         allocator: std.mem.Allocator,
@@ -74,6 +75,7 @@ pub const BitLinear = struct {
             .rows = rows,
             .cols = cols,
             .weights_gain = 1.0,
+            .activation_gain = 1.0,
         };
     }
 
@@ -131,7 +133,7 @@ pub const BitLinear = struct {
         }
     }
 
-    pub fn requantize(input: []const i32, out_buf: []i8) void {
+    pub fn requantize(input: []const i32, out_buf: []i8) f32 {
         std.debug.assert(input.len == out_buf.len);
 
         var max_abs: i64 = 0;
@@ -143,8 +145,7 @@ pub const BitLinear = struct {
 
         if (max_abs == 0) {
             @memset(out_buf, 0);
-            // return 1.0;
-            return;
+            return 1.0;
         }
 
         for (input, out_buf) |value, *out| {
@@ -159,8 +160,8 @@ pub const BitLinear = struct {
             out.* = @intCast(std.math.clamp(q, -127, 127));
         }
 
-        // const requant_gain = @as(f32, @floatFromInt(max_abs)) / 127.0;
-        // return requant_gain;
+        const requant_gain = @as(f32, @floatFromInt(max_abs)) / 127.0;
+        return requant_gain;
     }
 
     pub fn dequantizeInto(self: *const BitLinear, out: []f32) void {
