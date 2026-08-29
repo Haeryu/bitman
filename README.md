@@ -8,7 +8,9 @@ Some of the BitLinear implementation was adapted from my earlier experiment:
 [`stoneagemodel`](https://github.com/Haeryu/self_hackathon/tree/master/date20260816/stoneagemodel).
 
 The snake environment and evolutionary approach were inspired by [Learning to Fly](https://pwy.io/posts/learning-to-fly-pt1/).
-main.zig is vibe coded
+
+main.zig: mostly AI-generated glue/demo code.  
+bitlinear.zig and the core math/GA code: handwritten.
 
 ## Run
 
