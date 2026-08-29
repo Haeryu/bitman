@@ -14,7 +14,7 @@ pub const CrossoverMethod = enum {
 };
 
 pub const MutationMethod = union(enum) {
-    gaussian_mutation: struct {
+    uniform_mutation: struct {
         chance: f32,
         coeff: f32,
     },
@@ -63,7 +63,7 @@ pub fn evolve(
         }
 
         switch (comptime mutation_method) {
-            .gaussian_mutation => |v| {
+            .uniform_mutation => |v| {
                 gaussianMutation(v.chance, v.coeff, random, child, per_thread_buffer);
             },
         }
