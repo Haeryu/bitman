@@ -1,6 +1,12 @@
 # bitman
 > A ternary neural network (-1, 0, 1) evolved with a genetic algorithm to play Snake.
 
+## Screenshots
+
+![bitman](screenshots/1.gif)
+![bitman](screenshots/2.png)
+![bitman](screenshots/3.png)
+
 The network uses ternary weights (`-1, 0, 1`) inspired by [BitLinear](https://github.com/schneiderkamplab/bitlinear).
 
 I originally started this after looking for ways to train quantized networks without maintaining full-precision shadow weights. Instead of forcing backpropagation onto it, I went with evolutionary search.
@@ -52,8 +58,3 @@ The replay view supports:
 - `[` / `]`: decrease/increase playback speed
 - `Q`: return to training, or quit standalone replay
 - `Esc`: save the resume checkpoint and quit training; quit standalone replay
-
-## Screenshots
-
-![bitman](screenshots/1.gif)
-![bitman](screenshots/2.png)
