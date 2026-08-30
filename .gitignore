@@ -1,3 +1,4 @@
 .zig-cache
 zig-out
-bitman_snake.chk
+*.chk
+snake_replay.rep

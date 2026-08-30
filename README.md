@@ -19,6 +19,40 @@ bitlinear.zig and the core math/GA code: handwritten.
 zig build run -Doptimize=ReleaseFast
 ```
 
+## Evaluate saved champions
+
+```sh
+zig build eval -Doptimize=ReleaseFast
+```
+
+The training run keeps `bitman_snake.chk` as its resume checkpoint and writes
+clean generation snapshots every 50 generations (`bitman_snake_50.chk`,
+`bitman_snake_100.chk`, ...). `eval` evaluates every numbered snapshot on the
+same 1,000 fixed seeds and prints average food per episode. It also reports a
+100-network random ternary baseline using those same seeds.
+
+## Replay
+
+Press `Q` during training to pause evolution and replay the recorded
+`parents[0]` action track for the current process. Completed generation
+segments are appended to `snake_replay.rep`, which can be played later with:
+
+```sh
+zig build replay -Doptimize=ReleaseFast
+```
+
+The standalone replay command reads the stored action history from generation
+0 (or the first generation present in the file) through the last saved segment.
+The replay view supports:
+
+- `Space`: play/pause
+- `R`: restart
+- `1`-`9`, `0`: jump to 10%-100% of the track
+- `,` / `.`: step backward/forward one action
+- `[` / `]`: decrease/increase playback speed
+- `Q`: return to training, or quit standalone replay
+- `Esc`: save the resume checkpoint and quit training; quit standalone replay
+
 ## Screenshots
 
 ![bitman](screenshots/1.gif)

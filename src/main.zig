@@ -41,7 +41,8 @@ const Individual = bitman.Individual;
 //   3 fast
 //   4 turbo
 //   5 warp
-//   Q / Esc quit and print full history + graph
+//   Q replay the recorded parents[0] action stream
+//   Esc quit and print full history + graph
 // ============================================================================
 
 // ============================================================================
@@ -300,6 +301,12 @@ const SpeedMode = enum {
 const InputAction = struct {
     quit: bool = false,
     mode: ?SpeedMode = null,
+    replay: bool = false,
+    replay_toggle: bool = false,
+    replay_restart: bool = false,
+    replay_seek_percent: ?usize = null,
+    replay_step: i8 = 0,
+    replay_speed_delta: i8 = 0,
 };
 
 const WinConsole = struct {
@@ -451,12 +458,38 @@ const WinConsole = struct {
 
                 const ch = key.char.ascii_char;
                 switch (ch) {
-                    'q', 'Q' => action.quit = true,
-                    '1' => action.mode = .slow,
-                    '2' => action.mode = .normal,
-                    '3' => action.mode = .fast,
-                    '4' => action.mode = .turbo,
-                    '5' => action.mode = .warp,
+                    'q', 'Q' => action.replay = true,
+                    '1' => {
+                        action.mode = .slow;
+                        action.replay_seek_percent = 10;
+                    },
+                    '2' => {
+                        action.mode = .normal;
+                        action.replay_seek_percent = 20;
+                    },
+                    '3' => {
+                        action.mode = .fast;
+                        action.replay_seek_percent = 30;
+                    },
+                    '4' => {
+                        action.mode = .turbo;
+                        action.replay_seek_percent = 40;
+                    },
+                    '5' => {
+                        action.mode = .warp;
+                        action.replay_seek_percent = 50;
+                    },
+                    '6' => action.replay_seek_percent = 60,
+                    '7' => action.replay_seek_percent = 70,
+                    '8' => action.replay_seek_percent = 80,
+                    '9' => action.replay_seek_percent = 90,
+                    '0' => action.replay_seek_percent = 100,
+                    ' ' => action.replay_toggle = true,
+                    'r', 'R' => action.replay_restart = true,
+                    ',' => action.replay_step = -1,
+                    '.' => action.replay_step = 1,
+                    '[' => action.replay_speed_delta = -1,
+                    ']' => action.replay_speed_delta = 1,
                     else => {},
                 }
             }
@@ -494,6 +527,16 @@ const anchor_episode_count = 3;
 const starvation_base = 200;
 const starvation_per_body_cell = 3;
 
+// The replay stream records one champion track without allocating in the
+// simulation step. This upper bound covers eight episodes with a conservative
+// starvation budget for every possible body length.
+const replay_max_ticks_per_episode =
+    (board_cells - 3) *
+    (starvation_base + board_cells * starvation_per_body_cell) +
+    1;
+const replay_action_capacity = episode_count * replay_max_ticks_per_episode;
+const replay_segment_capacity = 4096;
+
 // 8 absolute rays * 2 channels + head xy + food xy + heading xy
 // + hunger + length + constant.
 const ray_count = 8;
@@ -527,10 +570,22 @@ const board_clear_reward: u64 = 100000;
 
 const history_capacity = 30;
 const stats_capacity_initial = 128;
+const evaluation_episode_count = 1000;
+const evaluation_seed_namespace: u64 = 0x4556_414c_5541_5445;
 
 const checkpoint_path = "bitman_snake.chk";
+const checkpoint_snapshot_interval: usize = 50;
+const checkpoint_snapshot_name_capacity = 64;
+const checkpoint_snapshot_prefix = "bitman_snake_";
+const checkpoint_snapshot_suffix = ".chk";
 const checkpoint_magic = "BMSNKCP1";
 const checkpoint_version: u64 = 1;
+
+const random_baseline_count: usize = 100;
+const replay_file_path = "snake_replay.rep";
+const replay_file_magic = "BMSNKRP1";
+const replay_file_version: u64 = 1;
+const replay_record_magic = "SEGM";
 
 const anchor_episode_seeds = [anchor_episode_count]u64{
     0x1111_2222_3333_4444,
@@ -868,6 +923,8 @@ const Agent = struct {
     clears: u64,
 
     done: bool,
+    last_action: RelativeAction,
+    last_action_valid: bool,
 
     fn init(seeds: *const [episode_count]u64) Agent {
         return .{
@@ -878,6 +935,8 @@ const Agent = struct {
             .total_steps = 0,
             .clears = 0,
             .done = false,
+            .last_action = .straight,
+            .last_action_valid = false,
         };
     }
 
@@ -901,6 +960,137 @@ const Agent = struct {
         self.game = SnakeGame.init(
             seeds[self.episode_index],
         );
+    }
+};
+
+const ReplaySegment = struct {
+    generation: usize,
+    episode_index: usize,
+    seed: u64,
+    start: usize,
+    len: usize,
+};
+
+const ReplayLog = struct {
+    actions: []RelativeAction,
+    segments: []ReplaySegment,
+    segment_count: usize,
+    action_count: usize,
+    persisted_segment_count: usize,
+    recording_enabled: bool,
+    truncated: bool,
+
+    fn init(
+        actions: []RelativeAction,
+        segments: []ReplaySegment,
+    ) ReplayLog {
+        return .{
+            .actions = actions,
+            .segments = segments,
+            .segment_count = 0,
+            .action_count = 0,
+            .persisted_segment_count = 0,
+            .recording_enabled = true,
+            .truncated = false,
+        };
+    }
+
+    fn deinit(self: *ReplayLog, allocator: std.mem.Allocator) void {
+        allocator.free(self.actions);
+        allocator.free(self.segments);
+        self.* = undefined;
+    }
+
+    fn reset(self: *ReplayLog) void {
+        self.segment_count = 0;
+        self.action_count = 0;
+        self.persisted_segment_count = 0;
+        self.recording_enabled = true;
+        self.truncated = false;
+    }
+
+    // Training only needs unpersisted replay data in memory. Once completed
+    // generations are appended to snake_replay.rep, compact them away so the
+    // hot simulation path can keep using fixed preallocated storage forever.
+    fn discardPersisted(self: *ReplayLog) void {
+        const discard_segments = self.persisted_segment_count;
+        if (discard_segments == 0) return;
+
+        std.debug.assert(discard_segments <= self.segment_count);
+
+        const first_kept_action = if (discard_segments < self.segment_count)
+            self.segments[discard_segments].start
+        else
+            self.action_count;
+
+        const kept_action_count = self.action_count - first_kept_action;
+        if (kept_action_count != 0) {
+            std.mem.copyForwards(
+                RelativeAction,
+                self.actions[0..kept_action_count],
+                self.actions[first_kept_action..self.action_count],
+            );
+        }
+
+        const kept_segment_count = self.segment_count - discard_segments;
+        for (0..kept_segment_count) |i| {
+            var segment = self.segments[discard_segments + i];
+            segment.start -= first_kept_action;
+            self.segments[i] = segment;
+        }
+
+        self.segment_count = kept_segment_count;
+        self.action_count = kept_action_count;
+        self.persisted_segment_count = 0;
+
+        // Capacity exhaustion should not normally happen because the action
+        // buffer is sized for a full generation. If it ever does, recover for
+        // subsequent generations after compaction rather than disabling replay
+        // forever.
+        self.recording_enabled = true;
+        self.truncated = false;
+    }
+
+    fn beginSegment(
+        self: *ReplayLog,
+        generation: usize,
+        episode_index: usize,
+        seed: u64,
+    ) void {
+        if (!self.recording_enabled) return;
+
+        if (self.segment_count >= self.segments.len) {
+            self.recording_enabled = false;
+            self.truncated = true;
+            return;
+        }
+
+        self.segments[self.segment_count] = .{
+            .generation = generation,
+            .episode_index = episode_index,
+            .seed = seed,
+            .start = self.action_count,
+            .len = 0,
+        };
+        self.segment_count += 1;
+    }
+
+    fn append(self: *ReplayLog, action: RelativeAction) void {
+        if (!self.recording_enabled or self.segment_count == 0) return;
+
+        if (self.action_count >= self.actions.len) {
+            self.recording_enabled = false;
+            self.truncated = true;
+            return;
+        }
+
+        self.actions[self.action_count] = action;
+        self.action_count += 1;
+        self.segments[self.segment_count - 1].len += 1;
+    }
+
+    fn totalActions(self: *const ReplayLog) usize {
+        return self.action_count;
     }
 };
 
@@ -947,6 +1137,7 @@ const Simulation = struct {
     history_len: usize,
 
     episode_seeds: [episode_count]u64,
+    replay_log: ReplayLog,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1027,6 +1218,18 @@ const Simulation = struct {
         );
         errdefer allocator.free(stats_log);
 
+        const replay_actions = try allocator.alloc(
+            RelativeAction,
+            replay_action_capacity,
+        );
+        errdefer allocator.free(replay_actions);
+
+        const replay_segments = try allocator.alloc(
+            ReplaySegment,
+            replay_segment_capacity,
+        );
+        errdefer allocator.free(replay_segments);
+
         var sim = Simulation{
             .agents = undefined,
             .parents = population_a,
@@ -1045,6 +1248,10 @@ const Simulation = struct {
             .history = @splat(0.0),
             .history_len = 0,
             .episode_seeds = undefined,
+            .replay_log = ReplayLog.init(
+                replay_actions,
+                replay_segments,
+            ),
         };
 
         sim.resetAgents();
@@ -1064,6 +1271,7 @@ const Simulation = struct {
         freePopulation(allocator, self.parents);
         freePopulation(allocator, self.children);
         allocator.free(self.stats_log);
+        self.replay_log.deinit(allocator);
         self.* = undefined;
     }
 
@@ -1072,8 +1280,25 @@ const Simulation = struct {
         io: std.Io,
         random: std.Random,
     ) !?GenerationStats {
+        const replay_episode_index = self.agents[0].episode_index;
+        const replay_was_done = self.agents[0].done;
+
         self.global_ticks += 1;
         try self.stepPopulationParallel(io);
+
+        if (!replay_was_done and
+            self.agents[0].last_action_valid)
+        {
+            self.replay_log.append(self.agents[0].last_action);
+
+            if (self.agents[0].episode_index != replay_episode_index) {
+                self.replay_log.beginSegment(
+                    self.generation,
+                    self.agents[0].episode_index,
+                    self.episode_seeds[self.agents[0].episode_index],
+                );
+            }
+        }
 
         if (self.allDone()) {
             return self.evolve(random);
@@ -1120,6 +1345,7 @@ const Simulation = struct {
         for (begin..end) |i| {
             const agent = &self.agents[i];
             const brain = &self.parents[i];
+            agent.last_action_valid = false;
             if (agent.done) continue;
 
             const input = makeInput(&agent.game);
@@ -1131,6 +1357,8 @@ const Simulation = struct {
             );
 
             const action = chooseAction(brain.out);
+            agent.last_action = action;
+            agent.last_action_valid = true;
             const events = agent.game.step(action);
 
             if (agent.game.status != .collision) {
@@ -1230,6 +1458,12 @@ const Simulation = struct {
         for (&self.agents) |*agent| {
             agent.* = Agent.init(&self.episode_seeds);
         }
+
+        self.replay_log.beginSegment(
+            self.generation,
+            0,
+            self.episode_seeds[0],
+        );
     }
 
     fn refreshEpisodeSeeds(self: *Simulation) void {
@@ -1401,6 +1635,245 @@ const Simulation = struct {
         self.history[history_capacity - 1] = value;
     }
 };
+
+const replay_speed_steps = [_]usize{
+    1,
+    16,
+    256,
+    4096,
+    65536,
+    1048576,
+};
+
+const ReplayPlayer = struct {
+    log: *const ReplayLog,
+    game: SnakeGame,
+    cursor: usize,
+    segment_index: usize,
+    action_index: usize,
+    speed_index: usize,
+    playing: bool,
+
+    fn init(log: *const ReplayLog) ReplayPlayer {
+        var player = ReplayPlayer{
+            .log = log,
+            .game = SnakeGame.init(0),
+            .cursor = 0,
+            .segment_index = 0,
+            .action_index = 0,
+            .speed_index = 0,
+            .playing = false,
+        };
+        player.seek(0);
+        return player;
+    }
+
+    fn restart(self: *ReplayPlayer) void {
+        self.seek(0);
+        self.playing = true;
+    }
+
+    fn seekPercent(self: *ReplayPlayer, percent: usize) void {
+        const clamped = @min(percent, 100);
+        const target = self.log.totalActions() * clamped / 100;
+        self.seek(target);
+    }
+
+    fn seek(self: *ReplayPlayer, target: usize) void {
+        const clamped = @min(target, self.log.totalActions());
+        self.cursor = clamped;
+
+        if (self.log.segment_count == 0) {
+            self.game = SnakeGame.init(0);
+            self.segment_index = 0;
+            self.action_index = 0;
+            return;
+        }
+
+        var remaining = clamped;
+
+        for (
+            self.log.segments[0..self.log.segment_count],
+            0..,
+        ) |segment, segment_index| {
+            if (remaining <= segment.len) {
+                self.segment_index = segment_index;
+                self.action_index = remaining;
+                self.game = SnakeGame.init(segment.seed);
+
+                for (0..remaining) |offset| {
+                    _ = self.game.step(
+                        self.log.actions[segment.start + offset],
+                    );
+                }
+                return;
+            }
+
+            remaining -= segment.len;
+        }
+
+        const last_index = self.log.segment_count - 1;
+        const last = self.log.segments[last_index];
+        self.segment_index = last_index;
+        self.action_index = last.len;
+        self.game = SnakeGame.init(last.seed);
+
+        for (0..last.len) |offset| {
+            _ = self.game.step(self.log.actions[last.start + offset]);
+        }
+    }
+
+    fn advance(self: *ReplayPlayer, steps: usize) void {
+        var remaining = steps;
+
+        while (remaining > 0 and
+            self.cursor < self.log.totalActions())
+        {
+            if (self.segment_index >= self.log.segment_count) break;
+
+            const segment = self.log.segments[self.segment_index];
+            if (self.action_index >= segment.len) {
+                self.segment_index += 1;
+                self.action_index = 0;
+
+                if (self.segment_index < self.log.segment_count) {
+                    self.game = SnakeGame.init(
+                        self.log.segments[self.segment_index].seed,
+                    );
+                }
+                continue;
+            }
+
+            _ = self.game.step(
+                self.log.actions[segment.start + self.action_index],
+            );
+            self.action_index += 1;
+            self.cursor += 1;
+            remaining -= 1;
+        }
+
+        if (self.cursor >= self.log.totalActions()) {
+            self.playing = false;
+        }
+    }
+
+    fn stepBackward(self: *ReplayPlayer) void {
+        if (self.cursor == 0) {
+            self.playing = false;
+            return;
+        }
+
+        self.seek(self.cursor - 1);
+        self.playing = false;
+    }
+
+    fn stepForward(self: *ReplayPlayer) void {
+        self.advance(1);
+        self.playing = false;
+    }
+
+    fn adjustSpeed(self: *ReplayPlayer, delta: i8) void {
+        if (delta < 0) {
+            if (self.speed_index != 0) self.speed_index -= 1;
+        } else if (delta > 0) {
+            if (self.speed_index + 1 < replay_speed_steps.len) {
+                self.speed_index += 1;
+            }
+        }
+    }
+
+    fn ticksPerFrame(self: *const ReplayPlayer) usize {
+        return replay_speed_steps[self.speed_index];
+    }
+
+    fn delayMs(self: *const ReplayPlayer) i64 {
+        return if (self.speed_index == 0) 25 else 0;
+    }
+
+    fn progressPercent(self: *const ReplayPlayer) usize {
+        const total = self.log.totalActions();
+        if (total == 0) return 0;
+        return self.cursor * 100 / total;
+    }
+
+    fn generation(self: *const ReplayPlayer) usize {
+        if (self.log.segment_count == 0) return 0;
+        return self.log.segments[
+            @min(self.segment_index, self.log.segment_count - 1)
+        ].generation;
+    }
+
+    fn nextActionName(self: *const ReplayPlayer) []const u8 {
+        var segment_index = self.segment_index;
+        var action_index = self.action_index;
+
+        while (segment_index < self.log.segment_count) {
+            const segment = self.log.segments[segment_index];
+            if (action_index < segment.len) {
+                return self.log.actions[
+                    segment.start + action_index
+                ].name();
+            }
+
+            segment_index += 1;
+            action_index = 0;
+        }
+
+        return "END";
+    }
+};
+
+test "replay log compacts persisted generations" {
+    var actions: [4]RelativeAction = undefined;
+    var segments: [3]ReplaySegment = undefined;
+    var log = ReplayLog.init(actions[0..], segments[0..]);
+
+    log.beginSegment(0, 0, 0x1111);
+    log.append(.left);
+    log.append(.straight);
+
+    log.beginSegment(1, 0, 0x2222);
+    log.append(.right);
+
+    log.persisted_segment_count = 1;
+    log.discardPersisted();
+
+    try std.testing.expectEqual(@as(usize, 1), log.segment_count);
+    try std.testing.expectEqual(@as(usize, 1), log.action_count);
+    try std.testing.expectEqual(@as(usize, 0), log.persisted_segment_count);
+    try std.testing.expectEqual(@as(usize, 0), log.segments[0].start);
+    try std.testing.expectEqual(@as(usize, 1), log.segments[0].generation);
+    try std.testing.expectEqual(RelativeAction.right, log.actions[0]);
+}
+
+test "replay player seeks across recorded segments" {
+    var actions: [3]RelativeAction = undefined;
+    var segments: [2]ReplaySegment = undefined;
+    var log = ReplayLog.init(actions[0..], segments[0..]);
+    log.beginSegment(0, 0, 0x1111);
+    log.append(.straight);
+    log.append(.left);
+    log.beginSegment(0, 1, 0x2222);
+    log.append(.right);
+
+    var player = ReplayPlayer.init(&log);
+    player.restart();
+    player.advance(2);
+
+    try std.testing.expectEqual(@as(usize, 2), player.cursor);
+    try std.testing.expectEqual(@as(usize, 0), player.segment_index);
+    try std.testing.expectEqual(@as(usize, 2), player.action_index);
+
+    player.advance(1);
+    try std.testing.expectEqual(@as(usize, 3), player.cursor);
+    try std.testing.expectEqual(@as(usize, 1), player.segment_index);
+    try std.testing.expectEqual(@as(usize, 1), player.action_index);
+
+    player.seekPercent(50);
+    try std.testing.expectEqual(@as(usize, 1), player.cursor);
+    try std.testing.expectEqual(@as(usize, 0), player.segment_index);
+    try std.testing.expectEqual(@as(usize, 1), player.action_index);
+}
 
 // ============================================================================
 // NETWORK INPUT / OUTPUT
@@ -1579,6 +2052,199 @@ fn chooseAction(output: []const i8) RelativeAction {
     }
 
     return action;
+}
+
+const EvalResult = struct {
+    foods: u64,
+    steps: u64,
+    cleared: bool,
+};
+
+const EvaluationSummary = struct {
+    average_foods_per_episode: f64,
+    best_foods: u64,
+    average_steps: f64,
+    clears: u64,
+};
+
+fn evaluationSeed(index: usize) u64 {
+    return splitMix64(
+        evaluation_seed_namespace +% @as(u64, @intCast(index)),
+    );
+}
+
+fn evaluateOne(
+    brain: *Individual,
+    seed: u64,
+    buffer: *Individual.PerThreadBuffer,
+) EvalResult {
+    var game = SnakeGame.init(seed);
+
+    while (game.status == .active) {
+        const input = makeInput(&game);
+
+        _ = brain.forward(
+            &input,
+            input_gain,
+            buffer,
+        );
+
+        const action = chooseAction(brain.out);
+        _ = game.step(action);
+    }
+
+    return .{
+        .foods = game.foods,
+        .steps = @intCast(game.ticks),
+        .cleared = game.status == .cleared,
+    };
+}
+
+fn evaluateChampion(
+    brain: *Individual,
+    buffer: *Individual.PerThreadBuffer,
+) EvaluationSummary {
+    var total_foods: u64 = 0;
+    var total_steps: u64 = 0;
+    var best_foods: u64 = 0;
+    var clears: u64 = 0;
+
+    for (0..evaluation_episode_count) |i| {
+        const result = evaluateOne(
+            brain,
+            evaluationSeed(i),
+            buffer,
+        );
+
+        total_foods += result.foods;
+        total_steps += result.steps;
+        best_foods = @max(best_foods, result.foods);
+
+        if (result.cleared) {
+            clears += 1;
+        }
+    }
+
+    const count: f64 = @floatFromInt(evaluation_episode_count);
+
+    return .{
+        .average_foods_per_episode = @as(f64, @floatFromInt(total_foods)) / count,
+        .best_foods = best_foods,
+        .average_steps = @as(f64, @floatFromInt(total_steps)) / count,
+        .clears = clears,
+    };
+}
+
+fn foodPerEpisode(average_foods_per_genome: f64) f64 {
+    return average_foods_per_genome /
+        @as(f64, @floatFromInt(episode_count));
+}
+
+fn evaluateRandomBaselineRange(
+    brains: []Individual,
+    buffer: *Individual.PerThreadBuffer,
+    begin: usize,
+    end: usize,
+    result: *EvaluationSummary,
+) void {
+    std.debug.assert(begin <= end);
+    std.debug.assert(end <= brains.len);
+
+    var average_foods_sum: f64 = 0.0;
+    var average_steps_sum: f64 = 0.0;
+    var best_foods: u64 = 0;
+    var clears: u64 = 0;
+
+    for (brains[begin..end]) |*brain| {
+        const summary = evaluateChampion(brain, buffer);
+        average_foods_sum += summary.average_foods_per_episode;
+        average_steps_sum += summary.average_steps;
+        best_foods = @max(best_foods, summary.best_foods);
+        clears += summary.clears;
+    }
+
+    const count: f64 = @floatFromInt(end - begin);
+
+    result.* = .{
+        .average_foods_per_episode = average_foods_sum / count,
+        .best_foods = best_foods,
+        .average_steps = average_steps_sum / count,
+        .clears = clears,
+    };
+}
+
+fn evaluateRandomBaseline(
+    brains: []Individual,
+    buffers: []Individual.PerThreadBuffer,
+    worker_count: usize,
+    io: std.Io,
+) !EvaluationSummary {
+    std.debug.assert(brains.len >= random_baseline_count);
+    std.debug.assert(buffers.len >= worker_count);
+    std.debug.assert(worker_count != 0);
+
+    var partials: [population_size]EvaluationSummary = undefined;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+
+    const chunk_size =
+        (random_baseline_count + worker_count - 1) / worker_count;
+    var worker_used: usize = 0;
+
+    for (0..worker_count) |worker_index| {
+        const begin = worker_index * chunk_size;
+        if (begin >= random_baseline_count) break;
+        const end = @min(begin + chunk_size, random_baseline_count);
+
+        group.concurrent(
+            io,
+            evaluateRandomBaselineRange,
+            .{
+                brains,
+                &buffers[worker_index],
+                begin,
+                end,
+                &partials[worker_index],
+            },
+        ) catch {
+            evaluateRandomBaselineRange(
+                brains,
+                &buffers[worker_index],
+                begin,
+                end,
+                &partials[worker_index],
+            );
+        };
+        worker_used += 1;
+    }
+
+    try group.await(io);
+
+    var average_foods_sum: f64 = 0.0;
+    var average_steps_sum: f64 = 0.0;
+    var best_foods: u64 = 0;
+    var clears: u64 = 0;
+
+    for (partials[0..worker_used], 0..) |partial, worker_index| {
+        const begin = worker_index * chunk_size;
+        const end = @min(begin + chunk_size, random_baseline_count);
+        const network_count: f64 = @floatFromInt(end - begin);
+
+        average_foods_sum +=
+            partial.average_foods_per_episode * network_count;
+        average_steps_sum += partial.average_steps * network_count;
+        best_foods = @max(best_foods, partial.best_foods);
+        clears += partial.clears;
+    }
+
+    const count: f64 = @floatFromInt(random_baseline_count);
+
+    return .{
+        .average_foods_per_episode = average_foods_sum / count,
+        .best_foods = best_foods,
+        .average_steps = average_steps_sum / count,
+        .clears = clears,
+    };
 }
 
 fn realOutput(value: i8, out_gain: f32) f32 {
@@ -1765,6 +2431,379 @@ const CheckpointDecoder = struct {
     }
 };
 
+const replay_file_header_size = replay_file_magic.len + (5 * 8);
+const replay_record_header_size = replay_record_magic.len + (4 * 8);
+
+fn makeReplayFileHeader() [replay_file_header_size]u8 {
+    var data: [replay_file_header_size]u8 = undefined;
+    var enc = CheckpointEncoder{ .buffer = &data };
+
+    enc.putBytes(replay_file_magic);
+    enc.putU64(replay_file_version);
+    enc.putU64(board_width);
+    enc.putU64(board_height);
+    enc.putU64(episode_count);
+    enc.putU64(1); // RelativeAction is encoded as one byte: 0, 1, or 2.
+
+    std.debug.assert(enc.pos == data.len);
+    return data;
+}
+
+fn validateReplayFileHeader(data: []const u8) !void {
+    if (data.len < replay_file_header_size) {
+        return error.TruncatedReplayFile;
+    }
+
+    var dec = CheckpointDecoder{
+        .buffer = data[0..replay_file_header_size],
+    };
+    var magic: [replay_file_magic.len]u8 = undefined;
+    try dec.takeBytes(&magic);
+
+    if (!std.mem.eql(u8, &magic, replay_file_magic)) {
+        return error.BadReplayFileMagic;
+    }
+    if (try dec.takeU64() != replay_file_version) {
+        return error.UnsupportedReplayFileVersion;
+    }
+    if (try dec.takeU64() != board_width or
+        try dec.takeU64() != board_height or
+        try dec.takeU64() != episode_count or
+        try dec.takeU64() != 1)
+    {
+        return error.ReplayConfigurationMismatch;
+    }
+}
+
+fn openReplayAppendFile(io: std.Io, path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(
+        io,
+        path,
+        .{
+            .mode = .read_write,
+            .allow_directory = false,
+        },
+    ) catch |err| switch (err) {
+        error.FileNotFound => std.Io.Dir.cwd().createFile(
+            io,
+            path,
+            .{
+                .read = true,
+                .truncate = false,
+            },
+        ),
+        else => |e| return e,
+    };
+}
+
+fn appendReplayFile(
+    log: *ReplayLog,
+    io: std.Io,
+    path: []const u8,
+    end_segment_count: usize,
+) !void {
+    const end = @min(end_segment_count, log.segment_count);
+    if (end <= log.persisted_segment_count) return;
+
+    var file = try openReplayAppendFile(io, path);
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size > std.math.maxInt(usize)) {
+        return error.ReplayFileTooLarge;
+    }
+
+    var writer = file.writer(io, &.{});
+
+    if (stat.size == 0) {
+        const header = makeReplayFileHeader();
+        try writer.interface.writeAll(&header);
+    } else {
+        if (stat.size < replay_file_header_size) {
+            return error.TruncatedReplayFile;
+        }
+
+        var header: [replay_file_header_size]u8 = undefined;
+        const read = try file.readPositionalAll(io, &header, 0);
+        if (read != header.len) return error.TruncatedReplayFile;
+        try validateReplayFileHeader(&header);
+        try writer.seekTo(stat.size);
+    }
+
+    for (log.segments[log.persisted_segment_count..end]) |segment| {
+        if (segment.len == 0) continue;
+
+        var record_header: [replay_record_header_size]u8 = undefined;
+        var enc = CheckpointEncoder{ .buffer = &record_header };
+        enc.putBytes(replay_record_magic);
+        enc.putU64(@intCast(segment.generation));
+        enc.putU64(@intCast(segment.episode_index));
+        enc.putU64(segment.seed);
+        enc.putU64(@intCast(segment.len));
+        std.debug.assert(enc.pos == record_header.len);
+        try writer.interface.writeAll(&record_header);
+
+        var action_bytes: [4096]u8 = undefined;
+        var written: usize = 0;
+        while (written < segment.len) {
+            const count = @min(
+                action_bytes.len,
+                segment.len - written,
+            );
+
+            for (0..count) |i| {
+                action_bytes[i] = @intCast(@intFromEnum(
+                    log.actions[segment.start + written + i],
+                ));
+            }
+
+            try writer.interface.writeAll(action_bytes[0..count]);
+            written += count;
+        }
+    }
+
+    try writer.end();
+    log.persisted_segment_count = end;
+}
+
+fn appendCompletedReplay(
+    sim: *Simulation,
+    io: std.Io,
+) !void {
+    var end = sim.replay_log.persisted_segment_count;
+
+    while (end < sim.replay_log.segment_count and
+        sim.replay_log.segments[end].generation < sim.generation)
+    {
+        end += 1;
+    }
+
+    try appendReplayFile(&sim.replay_log, io, replay_file_path, end);
+    sim.replay_log.discardPersisted();
+
+    // Normally resetAgents() already created the current generation's first
+    // segment before we compact the completed generation. If recording was
+    // disabled by an unexpected capacity exhaustion, begin it here after the
+    // old data has been freed so future generations keep recording.
+    if (sim.replay_log.segment_count == 0) {
+        sim.replay_log.beginSegment(
+            sim.generation,
+            sim.agents[0].episode_index,
+            sim.episode_seeds[sim.agents[0].episode_index],
+        );
+    }
+}
+
+const ReplayFileShape = struct {
+    segment_count: usize,
+    action_count: usize,
+};
+
+fn inspectReplayFile(data: []const u8) !ReplayFileShape {
+    try validateReplayFileHeader(data);
+
+    var dec = CheckpointDecoder{ .buffer = data };
+    dec.pos = replay_file_header_size;
+
+    var segment_count: usize = 0;
+    var action_count: usize = 0;
+
+    while (dec.pos < data.len) {
+        if (data.len - dec.pos < replay_record_header_size) {
+            return error.TruncatedReplayFile;
+        }
+
+        var record_magic: [replay_record_magic.len]u8 = undefined;
+        try dec.takeBytes(&record_magic);
+        if (!std.mem.eql(u8, &record_magic, replay_record_magic)) {
+            return error.BadReplayRecord;
+        }
+
+        const generation_u64 = try dec.takeU64();
+        const episode_index_u64 = try dec.takeU64();
+        _ = try dec.takeU64(); // seed
+        const segment_action_count_u64 = try dec.takeU64();
+
+        if (generation_u64 > std.math.maxInt(usize) or
+            episode_index_u64 >= episode_count or
+            segment_action_count_u64 > std.math.maxInt(usize))
+        {
+            return error.BadReplayRecord;
+        }
+
+        const segment_action_count: usize =
+            @intCast(segment_action_count_u64);
+
+        if (segment_action_count > data.len - dec.pos) {
+            return error.TruncatedReplayFile;
+        }
+
+        const action_end = dec.pos + segment_action_count;
+        for (data[dec.pos..action_end]) |action_byte| {
+            if (action_byte > @intFromEnum(RelativeAction.right)) {
+                return error.BadReplayRecord;
+            }
+        }
+        dec.pos = action_end;
+
+        if (segment_count == std.math.maxInt(usize)) {
+            return error.ReplayTooLong;
+        }
+        segment_count += 1;
+
+        if (segment_action_count > std.math.maxInt(usize) - action_count) {
+            return error.ReplayTooLong;
+        }
+        action_count += segment_action_count;
+    }
+
+    return .{
+        .segment_count = segment_count,
+        .action_count = action_count,
+    };
+}
+
+fn loadReplayFile(
+    log: *ReplayLog,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    var file = std.Io.Dir.cwd().openFile(
+        io,
+        path,
+        .{},
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.ReplayFileNotFound,
+        else => |e| return e,
+    };
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size == 0 or stat.size > std.math.maxInt(usize)) {
+        return error.BadReplayFile;
+    }
+
+    const data = try allocator.alloc(u8, @intCast(stat.size));
+    defer allocator.free(data);
+
+    var reader = file.reader(io, &.{});
+    reader.interface.readSliceAll(data) catch |err| switch (err) {
+        error.EndOfStream => return error.TruncatedReplayFile,
+        error.ReadFailed => return reader.err orelse error.BadReplayFile,
+    };
+
+    const shape = try inspectReplayFile(data);
+
+    const replay_actions = try allocator.alloc(
+        RelativeAction,
+        shape.action_count,
+    );
+    errdefer allocator.free(replay_actions);
+
+    const replay_segments = try allocator.alloc(
+        ReplaySegment,
+        shape.segment_count,
+    );
+    errdefer allocator.free(replay_segments);
+
+    var loaded = ReplayLog.init(
+        replay_actions,
+        replay_segments,
+    );
+
+    var dec = CheckpointDecoder{ .buffer = data };
+    dec.pos = replay_file_header_size;
+
+    while (dec.pos < data.len) {
+        var record_magic: [replay_record_magic.len]u8 = undefined;
+        try dec.takeBytes(&record_magic);
+        std.debug.assert(
+            std.mem.eql(u8, &record_magic, replay_record_magic),
+        );
+
+        const generation: usize = @intCast(try dec.takeU64());
+        const episode_index: usize = @intCast(try dec.takeU64());
+        const seed = try dec.takeU64();
+        const segment_action_count: usize =
+            @intCast(try dec.takeU64());
+
+        const segment_index = loaded.segment_count;
+        loaded.segments[segment_index] = .{
+            .generation = generation,
+            .episode_index = episode_index,
+            .seed = seed,
+            .start = loaded.action_count,
+            .len = segment_action_count,
+        };
+        loaded.segment_count += 1;
+
+        for (0..segment_action_count) |_| {
+            var action_byte: [1]u8 = undefined;
+            try dec.takeBytes(&action_byte);
+            loaded.actions[loaded.action_count] =
+                @enumFromInt(action_byte[0]);
+            loaded.action_count += 1;
+        }
+    }
+
+    std.debug.assert(loaded.segment_count == shape.segment_count);
+    std.debug.assert(loaded.action_count == shape.action_count);
+
+    loaded.persisted_segment_count = loaded.segment_count;
+    loaded.recording_enabled = false;
+
+    log.deinit(allocator);
+    log.* = loaded;
+}
+
+test "replay file round trips segmented actions" {
+    const test_path = "snake_replay_roundtrip_test.rep";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, test_path) catch {};
+
+    var actions: [3]RelativeAction = undefined;
+    var segments: [1]ReplaySegment = undefined;
+    var log = ReplayLog.init(actions[0..], segments[0..]);
+    log.beginSegment(7, 0, 0x1111);
+    log.append(.left);
+    log.append(.straight);
+    try appendReplayFile(
+        &log,
+        std.testing.io,
+        test_path,
+        log.segment_count,
+    );
+
+    const loaded_actions = try std.testing.allocator.alloc(
+        RelativeAction,
+        1,
+    );
+    const loaded_segments = try std.testing.allocator.alloc(
+        ReplaySegment,
+        1,
+    );
+    var loaded = ReplayLog.init(
+        loaded_actions,
+        loaded_segments,
+    );
+    defer loaded.deinit(std.testing.allocator);
+
+    try loadReplayFile(
+        &loaded,
+        std.testing.allocator,
+        std.testing.io,
+        test_path,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.segment_count);
+    try std.testing.expectEqual(@as(usize, 2), loaded.action_count);
+    try std.testing.expectEqual(@as(usize, 7), loaded.segments[0].generation);
+    try std.testing.expectEqual(@as(usize, 0), loaded.segments[0].episode_index);
+    try std.testing.expectEqual(RelativeAction.left, loaded.actions[0]);
+    try std.testing.expectEqual(RelativeAction.straight, loaded.actions[1]);
+}
+
 fn checkpointSize(sim: *const Simulation) usize {
     // magic + version + 7 configuration values + generation + stats_len + PRNG state
     var size: usize = checkpoint_magic.len + (14 * 8);
@@ -1790,10 +2829,11 @@ fn checkpointSize(sim: *const Simulation) usize {
     return size;
 }
 
-fn saveCheckpoint(
+fn saveCheckpointToPath(
     sim: *const Simulation,
     io: std.Io,
     prng: *const std.Random.DefaultPrng,
+    path: []const u8,
 ) !void {
     const size = checkpointSize(sim);
     const data = try sim.allocator.alloc(u8, size);
@@ -1850,9 +2890,53 @@ fn saveCheckpoint(
     std.debug.assert(enc.pos == data.len);
 
     try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = checkpoint_path,
+        .sub_path = path,
         .data = data,
     });
+}
+
+fn saveCheckpoint(
+    sim: *const Simulation,
+    io: std.Io,
+    prng: *const std.Random.DefaultPrng,
+) !void {
+    return saveCheckpointToPath(
+        sim,
+        io,
+        prng,
+        checkpoint_path,
+    );
+}
+
+fn checkpointSnapshotPath(
+    buffer: *[checkpoint_snapshot_name_capacity]u8,
+    generation: usize,
+) []const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "{s}{d}{s}",
+        .{
+            checkpoint_snapshot_prefix,
+            generation,
+            checkpoint_snapshot_suffix,
+        },
+    ) catch unreachable;
+}
+
+fn saveCheckpointSnapshot(
+    sim: *const Simulation,
+    io: std.Io,
+    prng: *const std.Random.DefaultPrng,
+) !void {
+    var path_buffer: [checkpoint_snapshot_name_capacity]u8 = undefined;
+    const path = checkpointSnapshotPath(&path_buffer, sim.generation);
+
+    try saveCheckpointToPath(
+        sim,
+        io,
+        prng,
+        path,
+    );
 }
 
 fn ensureStatsCapacity(sim: *Simulation, needed: usize) !void {
@@ -1890,14 +2974,15 @@ fn rebuildDerivedCheckpointState(sim: *Simulation) void {
     }
 }
 
-fn loadCheckpoint(
+fn loadCheckpointAtPath(
     sim: *Simulation,
     io: std.Io,
     prng: *std.Random.DefaultPrng,
+    path: []const u8,
 ) !bool {
     var file = std.Io.Dir.cwd().openFile(
         io,
-        checkpoint_path,
+        path,
         .{},
     ) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -2053,9 +3138,235 @@ fn loadCheckpoint(
 
     // Partial episodes are deliberately not persisted. Resume from the clean
     // generation boundary represented by the saved parent population.
+    sim.replay_log.reset();
     sim.resetAgents();
 
     return true;
+}
+
+fn loadCheckpoint(
+    sim: *Simulation,
+    io: std.Io,
+    prng: *std.Random.DefaultPrng,
+) !bool {
+    return loadCheckpointAtPath(
+        sim,
+        io,
+        prng,
+        checkpoint_path,
+    );
+}
+
+const EvaluationCheckpoint = struct {
+    generation: usize,
+    name: [checkpoint_snapshot_name_capacity]u8,
+    name_len: usize,
+
+    fn path(self: *const EvaluationCheckpoint) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+fn parseCheckpointSnapshotGeneration(name: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, name, checkpoint_snapshot_prefix) or
+        !std.mem.endsWith(u8, name, checkpoint_snapshot_suffix))
+    {
+        return null;
+    }
+
+    const digits = name[checkpoint_snapshot_prefix.len .. name.len - checkpoint_snapshot_suffix.len];
+
+    if (digits.len == 0) return null;
+
+    for (digits) |digit| {
+        if (digit < '0' or digit > '9') return null;
+    }
+
+    const generation = std.fmt.parseInt(usize, digits, 10) catch return null;
+    return if (generation == 0) null else generation;
+}
+
+fn collectEvaluationCheckpoints(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) ![]EvaluationCheckpoint {
+    var checkpoints: std.ArrayList(EvaluationCheckpoint) = .empty;
+    errdefer checkpoints.deinit(allocator);
+
+    var dir = try std.Io.Dir.cwd().openDir(
+        io,
+        ".",
+        .{ .iterate = true },
+    );
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+
+        const generation =
+            parseCheckpointSnapshotGeneration(entry.name) orelse continue;
+
+        if (entry.name.len > checkpoint_snapshot_name_capacity) continue;
+
+        var checkpoint = EvaluationCheckpoint{
+            .generation = generation,
+            .name = undefined,
+            .name_len = entry.name.len,
+        };
+        @memcpy(checkpoint.name[0..entry.name.len], entry.name);
+
+        try checkpoints.append(allocator, checkpoint);
+    }
+
+    if (checkpoints.items.len > 1) {
+        for (1..checkpoints.items.len) |i| {
+            var j = i;
+            while (j > 0 and
+                checkpoints.items[j - 1].generation >
+                    checkpoints.items[j].generation)
+            {
+                const temp = checkpoints.items[j - 1];
+                checkpoints.items[j - 1] = checkpoints.items[j];
+                checkpoints.items[j] = temp;
+                j -= 1;
+            }
+        }
+    }
+
+    return checkpoints.toOwnedSlice(allocator);
+}
+
+fn evaluateSavedCheckpoints(
+    sim: *Simulation,
+    io: std.Io,
+    random: std.Random,
+    prng: *std.Random.DefaultPrng,
+) !void {
+    const checkpoints = try collectEvaluationCheckpoints(
+        sim.allocator,
+        io,
+    );
+    defer sim.allocator.free(checkpoints);
+
+    if (checkpoints.len == 0) {
+        std.debug.print(
+            "[evaluation] no numbered checkpoints matching {s}<generation>{s}\n",
+            .{ checkpoint_snapshot_prefix, checkpoint_snapshot_suffix },
+        );
+        return;
+    }
+
+    const champion = &sim.parents[0];
+    var buffer = try Individual.PerThreadBuffer.init(
+        sim.allocator,
+        champion.maxRowColLen(),
+        champion.maxElementsLen(),
+    );
+    defer buffer.deinit(sim.allocator);
+
+    std.debug.print(
+        "[evaluation] random baseline: {d} networks x {d} fixed seeds\n",
+        .{ random_baseline_count, evaluation_episode_count },
+    );
+    const baseline = evaluateRandomBaseline(
+        sim.parents[0..random_baseline_count],
+        sim.eval_buffers,
+        sim.worker_count,
+        io,
+    ) catch |err| return err;
+
+    std.debug.print(
+        "\n================ CHECKPOINT EVALUATION ================\n",
+        .{},
+    );
+    std.debug.print(
+        "found {d} checkpoints; fixed seeds {d}\n\n",
+        .{ checkpoints.len, evaluation_episode_count },
+    );
+    std.debug.print(
+        "random baseline: avg food/episode {d:.3} | best food {d} | avg steps/episode {d:.1} | clears {d}\n\n",
+        .{
+            baseline.average_foods_per_episode,
+            baseline.best_foods,
+            baseline.average_steps,
+            baseline.clears,
+        },
+    );
+    std.debug.print(
+        " generation | avg food/episode | best food | avg steps | clears | checkpoint\n",
+        .{},
+    );
+    std.debug.print(
+        "------------+------------------+-----------+-----------+--------+------------\n",
+        .{},
+    );
+
+    var evaluated_count: usize = 0;
+
+    for (checkpoints) |checkpoint| {
+        const loaded = loadCheckpointAtPath(
+            sim,
+            io,
+            prng,
+            checkpoint.path(),
+        ) catch |err| {
+            std.debug.print(
+                "[evaluation] skip {s}: {s}\n",
+                .{ checkpoint.path(), @errorName(err) },
+            );
+
+            const allocator = sim.allocator;
+            sim.deinit(allocator);
+            sim.* = try Simulation.init(allocator, random);
+            continue;
+        };
+
+        if (!loaded) {
+            std.debug.print(
+                "[evaluation] skip {s}: file disappeared\n",
+                .{checkpoint.path()},
+            );
+            continue;
+        }
+
+        if (sim.generation != checkpoint.generation) {
+            std.debug.print(
+                "[evaluation] skip {s}: header generation {d} != filename generation {d}\n",
+                .{
+                    checkpoint.path(),
+                    sim.generation,
+                    checkpoint.generation,
+                },
+            );
+            continue;
+        }
+
+        const summary = evaluateChampion(
+            &sim.parents[0],
+            &buffer,
+        );
+
+        std.debug.print(
+            "{d:>11} | {d:>16.3} | {d:>9} | {d:>9.1} | {d:>6} | {s}\n",
+            .{
+                sim.generation,
+                summary.average_foods_per_episode,
+                summary.best_foods,
+                summary.average_steps,
+                summary.clears,
+                checkpoint.path(),
+            },
+        );
+        evaluated_count += 1;
+    }
+
+    if (evaluated_count == 0) {
+        std.debug.print(
+            "[evaluation] no valid numbered checkpoints were evaluated\n",
+            .{},
+        );
+    }
 }
 
 // ============================================================================
@@ -2120,12 +3431,13 @@ fn render(
         0,
         2,
         COLOR_WHITE,
-        "current: best fitness {d:<9} avg {d:<10.1} best food {d:<4} avg food {d:<6.2} best steps {d}",
+        "current: best fitness {d:<9} avg fitness {d:<10.1} best food {d:<4} avg food/genome {d:<6.2} food/episode {d:<6.3} best steps {d}",
         .{
             current.best_fitness,
             current.average_fitness,
             current.best_foods,
             current.average_foods,
+            foodPerEpisode(current.average_foods),
             current.best_steps,
         },
     );
@@ -2134,10 +3446,11 @@ fn render(
         0,
         3,
         COLOR_DIM,
-        "previous: best fitness {d:<9} avg food {d:<6.2} best food {d:<4} | best-ever food {d}",
+        "previous: best fitness {d:<9} avg food/genome {d:<6.2} food/episode {d:<6.3} best food {d:<4} | best-ever food/genome {d}",
         .{
             sim.last_stats.best_fitness,
             sim.last_stats.average_foods,
+            foodPerEpisode(sim.last_stats.average_foods),
             sim.last_stats.best_foods,
             sim.best_ever_foods,
         },
@@ -2162,7 +3475,7 @@ fn render(
     frame.write(
         0,
         5,
-        "keys: [1] slow  [2] normal  [3] fast  [4] turbo  [5] WARP  [Q/Esc] history + graph + quit",
+        "keys: [1] slow  [2] normal  [3] fast  [4] turbo  [5] WARP  [Q] replay  [Esc] save + quit",
         COLOR_YELLOW,
     );
 
@@ -2348,7 +3661,7 @@ fn render(
     frame.write(
         panel_x,
         31,
-        "AVG FOOD / GENERATION",
+        "AVG FOOD / GENOME",
         COLOR_CYAN,
     );
 
@@ -2358,6 +3671,140 @@ fn render(
         33,
         &sim.history,
         sim.history_len,
+    );
+
+    console.present(&frame);
+}
+
+fn renderReplay(
+    console: *WinConsole,
+    player: *const ReplayPlayer,
+) void {
+    var frame = Frame.init();
+
+    const total = player.log.totalActions();
+    const percent = player.progressPercent();
+    const playback = if (player.playing) "PLAYING" else "PAUSED";
+    const recording = if (player.log.truncated)
+        "TRUNCATED"
+    else if (player.log.recording_enabled)
+        "RECORDING"
+    else
+        "STOPPED";
+    const segment = if (player.log.segment_count == 0)
+        0
+    else
+        @min(player.segment_index + 1, player.log.segment_count);
+
+    frame.write(
+        0,
+        0,
+        "BITMAN SNAKE // action replay // parents[0] track",
+        COLOR_CYAN,
+    );
+
+    frame.writeFmt(
+        0,
+        1,
+        COLOR_WHITE,
+        "{s}  generation {d}  actions {d}/{d}  ({d}%)  segment {d}/{d}",
+        .{
+            playback,
+            player.generation(),
+            player.cursor,
+            total,
+            percent,
+            segment,
+            player.log.segment_count,
+        },
+    );
+
+    frame.writeFmt(
+        0,
+        2,
+        COLOR_WHITE,
+        "speed {d} ticks/frame  next {s}  {s}",
+        .{
+            player.ticksPerFrame(),
+            player.nextActionName(),
+            recording,
+        },
+    );
+
+    const progress_width: usize = 62;
+    const filled = if (total == 0)
+        0
+    else
+        percent * progress_width / 100;
+
+    for (0..progress_width) |i| {
+        frame.put(
+            1 + i,
+            4,
+            if (i < filled) '#' else '-',
+            if (i < filled) COLOR_GREEN else COLOR_DIM,
+        );
+    }
+
+    frame.write(
+        0,
+        5,
+        "keys: [Space] play/pause  [R] restart  [1-0] seek  [,/.] step  [[/]] speed  [Q] back/quit  [Esc] save + quit",
+        COLOR_YELLOW,
+    );
+
+    const grid_x: usize = 1;
+    const grid_y: usize = 7;
+    drawWorldBorder(&frame, grid_x, grid_y);
+    drawGame(&frame, &player.game, grid_x, grid_y);
+
+    const panel_x: usize = 64;
+
+    frame.write(
+        panel_x,
+        7,
+        "REPLAY STATE",
+        COLOR_YELLOW,
+    );
+
+    frame.writeFmt(
+        panel_x,
+        9,
+        COLOR_WHITE,
+        "status      {s}",
+        .{player.game.status.name()},
+    );
+
+    frame.writeFmt(
+        panel_x,
+        10,
+        COLOR_WHITE,
+        "food        {d}   length {d}",
+        .{ player.game.foods, player.game.length },
+    );
+
+    frame.writeFmt(
+        panel_x,
+        11,
+        COLOR_WHITE,
+        "ticks       {d}",
+        .{player.game.ticks},
+    );
+
+    frame.writeFmt(
+        panel_x,
+        12,
+        COLOR_WHITE,
+        "direction   {s}",
+        .{player.game.direction.name()},
+    );
+
+    frame.writeFmt(
+        panel_x,
+        14,
+        COLOR_DIM,
+        "track stores actions only; game state is deterministic",
+        .{},
     );
 
     console.present(&frame);
@@ -2545,7 +3992,7 @@ fn drawHistory(
         x,
         y + graph_height,
         COLOR_DIM,
-        "max avg {d:.2}",
+        "max avg/genome {d:.2}",
         .{max_value},
     );
 }
@@ -2595,7 +4042,7 @@ fn printFoodGraph(sim: *const Simulation) void {
         .{},
     );
     std.debug.print(
-        "# best food   + average food   @ overlap   ({d} generations -> {d} columns)\n\n",
+        "# best food/genome   + avg food/genome   @ overlap   ({d} generations -> {d} columns)\n\n",
         .{ sim.stats_len, columns },
     );
 
@@ -2735,23 +4182,24 @@ fn printFinalReport(sim: *const Simulation) void {
         std.debug.print("No generation finished before quit.\n", .{});
     } else {
         std.debug.print(
-            " gen | best fitness | avg fitness | best food | avg food | best steps | clears | ticks\n",
+            " gen | best fitness | avg fitness | best food/genome | avg food/genome | food/episode | best steps | clears | ticks\n",
             .{},
         );
         std.debug.print(
-            "-----+--------------+-------------+-----------+----------+------------+--------+------\n",
+            "-----+--------------+-------------+------------------+-----------------+--------------+------------+--------+------\n",
             .{},
         );
 
         for (sim.stats_log[0..sim.stats_len]) |stats| {
             std.debug.print(
-                "{d:>4} | {d:>12} | {d:>11.1} | {d:>9} | {d:>8.2} | {d:>10} | {d:>6} | {d}\n",
+                "{d:>4} | {d:>12} | {d:>11.1} | {d:>16} | {d:>15.2} | {d:>12.3} | {d:>10} | {d:>6} | {d}\n",
                 .{
                     stats.generation,
                     stats.best_fitness,
                     stats.average_fitness,
                     stats.best_foods,
                     stats.average_foods,
+                    foodPerEpisode(stats.average_foods),
                     stats.best_steps,
                     stats.total_clears,
                     stats.global_ticks,
@@ -2763,11 +4211,12 @@ fn printFinalReport(sim: *const Simulation) void {
         const last = sim.stats_log[sim.stats_len - 1];
 
         std.debug.print(
-            "\nfirst avg food {d:.3} -> last {d:.3} (delta {d:.3})\n",
+            "\nfirst avg food/genome {d:.3} ({d:.3}/episode) -> last {d:.3} ({d:.3}/episode)\n",
             .{
                 first.average_foods,
+                foodPerEpisode(first.average_foods),
                 last.average_foods,
-                last.average_foods - first.average_foods,
+                foodPerEpisode(last.average_foods),
             },
         );
 
@@ -2781,13 +4230,14 @@ fn printFinalReport(sim: *const Simulation) void {
     }
 
     std.debug.print(
-        "\ncurrent partial gen {d}: best fitness {d}, avg {d:.1}, best food {d}, avg food {d:.2}\n",
+        "\ncurrent partial gen {d}: best fitness {d}, avg fitness {d:.1}, best food {d}, avg food/genome {d:.2}, food/episode {d:.3}\n",
         .{
             sim.generation,
             current.best_fitness,
             current.average_fitness,
             current.best_foods,
             current.average_foods,
+            foodPerEpisode(current.average_foods),
         },
     );
 
@@ -2814,9 +4264,15 @@ pub fn main(
     );
 
     var mode: SpeedMode = .normal;
+    var eval_mode = false;
+    var replay_file_mode = false;
 
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--slow")) {
+        if (std.mem.eql(u8, arg, "--eval")) {
+            eval_mode = true;
+        } else if (std.mem.eql(u8, arg, "--replay")) {
+            replay_file_mode = true;
+        } else if (std.mem.eql(u8, arg, "--slow")) {
             mode = .slow;
         } else if (std.mem.eql(u8, arg, "--fast")) {
             mode = .fast;
@@ -2840,30 +4296,68 @@ pub fn main(
     );
     defer sim.deinit(allocator);
 
-    const checkpoint_loaded = loadCheckpoint(
-        &sim,
-        io,
-        &prng,
-    ) catch |err| blk: {
+    if (eval_mode and replay_file_mode) {
         std.debug.print(
-            "[checkpoint] ignored {s}: {s}\n",
-            .{ checkpoint_path, @errorName(err) },
+            "[args] --eval and --replay are mutually exclusive\n",
+            .{},
         );
+        return;
+    }
 
-        // loadCheckpoint may have already copied some bytes before discovering
-        // corruption. Rebuild a pristine simulation instead of continuing from
-        // a half-loaded population.
-        sim.deinit(allocator);
-        prng = .init(initial_prng_seed);
-        sim = try Simulation.init(allocator, random);
-        break :blk false;
-    };
+    if (eval_mode) {
+        evaluateSavedCheckpoints(
+            &sim,
+            io,
+            random,
+            &prng,
+        ) catch |err| {
+            std.debug.print(
+                "[evaluation] failed: {s}\n",
+                .{@errorName(err)},
+            );
+        };
+        return;
+    }
 
-    if (checkpoint_loaded) {
-        std.debug.print(
-            "[checkpoint] loaded {s}: resume at generation {d}\n",
-            .{ checkpoint_path, sim.generation },
-        );
+    if (replay_file_mode) {
+        loadReplayFile(
+            &sim.replay_log,
+            allocator,
+            io,
+            replay_file_path,
+        ) catch |err| {
+            std.debug.print(
+                "[replay] failed to load {s}: {s}\n",
+                .{ replay_file_path, @errorName(err) },
+            );
+            return;
+        };
+    } else {
+        const checkpoint_loaded = loadCheckpoint(
+            &sim,
+            io,
+            &prng,
+        ) catch |err| blk: {
+            std.debug.print(
+                "[checkpoint] ignored {s}: {s}\n",
+                .{ checkpoint_path, @errorName(err) },
+            );
+
+            // loadCheckpoint may have already copied some bytes before discovering
+            // corruption. Rebuild a pristine simulation instead of continuing from
+            // a half-loaded population.
+            sim.deinit(allocator);
+            prng = .init(initial_prng_seed);
+            sim = try Simulation.init(allocator, random);
+            break :blk false;
+        };
+
+        if (checkpoint_loaded) {
+            std.debug.print(
+                "[checkpoint] loaded {s}: resume at generation {d}\n",
+                .{ checkpoint_path, sim.generation },
+            );
+        }
     }
 
     var console = try WinConsole.init();
@@ -2877,11 +4371,19 @@ pub fn main(
         }
     }
 
-    render(
-        &console,
-        &sim,
-        mode,
-    );
+    var replay_mode = replay_file_mode;
+    var replay_player = ReplayPlayer.init(&sim.replay_log);
+
+    if (replay_mode) {
+        replay_player.restart();
+        renderReplay(&console, &replay_player);
+    } else {
+        render(
+            &console,
+            &sim,
+            mode,
+        );
+    }
 
     var running = true;
 
@@ -2889,14 +4391,80 @@ pub fn main(
         const action = console.pollInput();
 
         if (action.quit) {
-            saveCheckpoint(&sim, io, &prng) catch |err| {
-                std.debug.print(
-                    "\n[checkpoint] save failed: {s}\n",
-                    .{@errorName(err)},
-                );
-            };
+            if (!replay_file_mode) {
+                saveCheckpoint(&sim, io, &prng) catch |err| {
+                    std.debug.print(
+                        "\n[checkpoint] save failed: {s}\n",
+                        .{@errorName(err)},
+                    );
+                };
+
+                appendCompletedReplay(&sim, io) catch |err| {
+                    std.debug.print(
+                        "\n[replay] append failed: {s}\n",
+                        .{@errorName(err)},
+                    );
+                };
+            }
             running = false;
             break;
+        }
+
+        if (replay_mode) {
+            if (action.replay) {
+                if (replay_file_mode) {
+                    running = false;
+                    break;
+                }
+
+                replay_mode = false;
+                render(&console, &sim, mode);
+                continue;
+            }
+
+            if (action.replay_restart) {
+                replay_player.restart();
+            }
+
+            if (action.replay_seek_percent) |percent| {
+                replay_player.seekPercent(percent);
+            }
+
+            if (action.replay_speed_delta != 0) {
+                replay_player.adjustSpeed(action.replay_speed_delta);
+            }
+
+            if (action.replay_toggle) {
+                replay_player.playing = !replay_player.playing;
+            }
+
+            if (action.replay_step < 0) {
+                replay_player.stepBackward();
+            } else if (action.replay_step > 0) {
+                replay_player.stepForward();
+            }
+
+            if (replay_player.playing) {
+                replay_player.advance(replay_player.ticksPerFrame());
+            }
+
+            renderReplay(&console, &replay_player);
+
+            const replay_delay_ms = replay_player.delayMs();
+            if (replay_delay_ms != 0) {
+                io.sleep(
+                    .fromMilliseconds(replay_delay_ms),
+                    .awake,
+                ) catch {};
+            }
+            continue;
+        }
+
+        if (action.replay) {
+            replay_mode = true;
+            replay_player.restart();
+            renderReplay(&console, &replay_player);
+            continue;
         }
 
         if (action.mode) |new_mode| {
@@ -2911,6 +4479,22 @@ pub fn main(
                 saveCheckpoint(&sim, io, &prng) catch |err| {
                     std.debug.print(
                         "\n[checkpoint] save failed: {s}\n",
+                        .{@errorName(err)},
+                    );
+                };
+
+                if (sim.generation % checkpoint_snapshot_interval == 0) {
+                    saveCheckpointSnapshot(&sim, io, &prng) catch |err| {
+                        std.debug.print(
+                            "\n[checkpoint] snapshot generation {d} save failed: {s}\n",
+                            .{ sim.generation, @errorName(err) },
+                        );
+                    };
+                }
+
+                appendCompletedReplay(&sim, io) catch |err| {
+                    std.debug.print(
+                        "\n[replay] append failed: {s}\n",
                         .{@errorName(err)},
                     );
                 };
@@ -2935,5 +4519,7 @@ pub fn main(
     console.end();
     console_active = false;
 
-    printFinalReport(&sim);
+    if (!replay_file_mode) {
+        printFinalReport(&sim);
+    }
 }
