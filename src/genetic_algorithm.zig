@@ -64,7 +64,7 @@ pub fn evolve(
 
         switch (comptime mutation_method) {
             .uniform_mutation => |v| {
-                gaussianMutation(v.chance, v.coeff, random, child, per_thread_buffer);
+                uniformMutation(v.chance, v.coeff, random, child, per_thread_buffer);
             },
         }
     }
@@ -160,7 +160,7 @@ fn projectedGain(values: []const f32, fallback_gain: f32) f32 {
     );
 }
 
-fn gaussianMutation(
+fn uniformMutation(
     chance: f32,
     coeff: f32,
     random: std.Random,

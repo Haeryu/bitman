@@ -9,17 +9,17 @@ const Individual = bitman.Individual;
 // One-file evolutionary Snake experiment for Haeryu/bitman.
 //
 // Genome evaluation:
-//   - 96 genomes
+//   - 128 genomes
 //   - 8 shared episodes per generation: 3 anchors + 5 rotating seeds
-//   - 32 -> 64 -> 32 -> 3 ternary network
+//   - 25 -> 256 -> 256 -> 3 ternary network
 //   - outputs: TURN LEFT / GO STRAIGHT / TURN RIGHT
-//   - top 6 genomes are copied unchanged (elitism)
+//   - top 8 genomes are copied unchanged (elitism)
 //   - remaining children use roulette + uniform crossover + mutation
 //
-// Sensors (32 i8 inputs):
-//   - immediate danger: straight / left / right
-//   - 8 body-relative rays x (wall proximity, body proximity, food visibility)
-//   - food vector in the snake's local forward/right frame
+// Sensors (25 i8 inputs):
+//   - 8 world-space rays x (wall proximity, body proximity)
+//   - separate absolute head and food coordinates
+//   - absolute heading vector
 //   - hunger, length, and an explicit +1 constant
 //
 // Fitness:
@@ -494,16 +494,28 @@ const anchor_episode_count = 3;
 const starvation_base = 200;
 const starvation_per_body_cell = 3;
 
-// 3 danger + 8 rays * 3 channels + 2 local food + hunger + length + constant.
-const input_count = 32;
+// 8 absolute rays * 2 channels + head xy + food xy + heading xy
+// + hunger + length + constant.
+const ray_count = 8;
+const ray_channel_count = 2;
+const ray_input_count = ray_count * ray_channel_count;
+const head_x_input = ray_input_count;
+const head_y_input = head_x_input + 1;
+const food_x_input = head_y_input + 1;
+const food_y_input = food_x_input + 1;
+const direction_x_input = food_y_input + 1;
+const direction_y_input = direction_x_input + 1;
+const hunger_input = direction_y_input + 1;
+const length_input = hunger_input + 1;
+const constant_input = length_input + 1;
+const input_count = constant_input + 1;
 const hidden0 = 256;
 const hidden1 = 256;
 const output_count = 3;
 
 const input_gain: f32 = 1.0 / 127.0;
 
-// ~9.4k ternary weights. 0.25% keeps the expected number of directly
-// mutated weights near the old smaller network (~24 per child).
+// 72,704 ternary weights. At 0.25%, roughly 182 weights mutate per child.
 const mutation_chance: f32 = 0.0025;
 const mutation_coeff: f32 = 1.0;
 
@@ -792,22 +804,6 @@ const SnakeGame = struct {
         }
 
         return false;
-    }
-
-    fn wouldCollide(
-        self: *const SnakeGame,
-        direction: Direction,
-    ) bool {
-        const delta = direction.delta();
-        const next = Pos{
-            .x = self.head().x + delta.x,
-            .y = self.head().y + delta.y,
-        };
-
-        if (!insideBoard(next)) return true;
-
-        const eating = Pos.eql(next, self.food);
-        return self.collidesWithBody(next, eating);
     }
 
     fn contains(self: *const SnakeGame, pos: Pos) bool {
@@ -1184,7 +1180,7 @@ const Simulation = struct {
             .roulette_wheel,
             .uniform_crossover,
             .{
-                .gaussian_mutation = .{
+                .uniform_mutation = .{
                     .chance = mutation_chance,
                     .coeff = mutation_coeff,
                 },
@@ -1413,78 +1409,71 @@ const Simulation = struct {
 const RaySense = struct {
     wall_proximity: f32,
     body_proximity: f32,
-    food_visibility: f32,
 };
 
 fn makeInput(game: *const SnakeGame) [input_count]i8 {
     var result: [input_count]i8 = @splat(0);
 
-    result[0] = quantizeBool(game.wouldCollide(game.direction));
-    result[1] = quantizeBool(game.wouldCollide(game.direction.left()));
-    result[2] = quantizeBool(game.wouldCollide(game.direction.right()));
-
-    // Eight body-relative rays: F, FR, R, BR, B, BL, L, FL.
-    // Because actions are also relative, the controller does not have to learn
-    // four rotated copies of the same wall/body avoidance policy.
-    const forward = game.direction.delta();
-    const right = game.direction.right().delta();
-    const back = game.direction.right().right().delta();
-    const left = game.direction.left().delta();
-
+    // World-space order: N, NE, E, SE, S, SW, W, NW. The action remains
+    // body-relative, so the network must combine these rays with the heading.
     const ray_deltas = [_]Pos{
-        forward,
-        addPos(forward, right),
-        right,
-        addPos(back, right),
-        back,
-        addPos(back, left),
-        left,
-        addPos(forward, left),
+        .{ .x = 0, .y = -1 },
+        .{ .x = 1, .y = -1 },
+        .{ .x = 1, .y = 0 },
+        .{ .x = 1, .y = 1 },
+        .{ .x = 0, .y = 1 },
+        .{ .x = -1, .y = 1 },
+        .{ .x = -1, .y = 0 },
+        .{ .x = -1, .y = -1 },
     };
+    comptime std.debug.assert(ray_deltas.len == ray_count);
 
     for (ray_deltas, 0..) |delta, ray_index| {
         const sense = senseRay(game, delta);
-        const base = 3 + ray_index * 3;
+        const base = ray_index * ray_channel_count;
 
         result[base + 0] = quantizeZeroOne(sense.wall_proximity);
         result[base + 1] = quantizeZeroOne(sense.body_proximity);
-        result[base + 2] = quantizeZeroOne(sense.food_visibility);
     }
 
     const head = game.head();
-    const to_food = Pos{
-        .x = game.food.x - head.x,
-        .y = game.food.y - head.y,
-    };
+    const direction = game.direction.delta();
+    const max_x: f32 = @floatFromInt(board_width - 1);
+    const max_y: f32 = @floatFromInt(board_height - 1);
 
-    const food_forward =
-        @as(i32, to_food.x) * @as(i32, forward.x) +
-        @as(i32, to_food.y) * @as(i32, forward.y);
-    const food_right =
-        @as(i32, to_food.x) * @as(i32, right.x) +
-        @as(i32, to_food.y) * @as(i32, right.y);
-
-    const max_axis: f32 = @as(
-        f32,
-        @floatFromInt(@max(board_width - 1, board_height - 1)),
+    // Positions are kept separate and in board coordinates. Computing the food
+    // delta and rotating it into the snake's frame is now network work.
+    result[head_x_input] = quantizeZeroOne(
+        @as(f32, @floatFromInt(head.x)) / max_x,
+    );
+    result[head_y_input] = quantizeZeroOne(
+        @as(f32, @floatFromInt(head.y)) / max_y,
+    );
+    result[food_x_input] = quantizeZeroOne(
+        @as(f32, @floatFromInt(game.food.x)) / max_x,
+    );
+    result[food_y_input] = quantizeZeroOne(
+        @as(f32, @floatFromInt(game.food.y)) / max_y,
     );
 
-    // Local coordinates remove the need to relearn the same food-seeking rule
-    // four times for four absolute headings.
-    result[27] = quantizeUnit(@as(f32, @floatFromInt(food_forward)) / max_axis);
-    result[28] = quantizeUnit(@as(f32, @floatFromInt(food_right)) / max_axis);
+    result[direction_x_input] = quantizeUnit(
+        @as(f32, @floatFromInt(direction.x)),
+    );
+    result[direction_y_input] = quantizeUnit(
+        @as(f32, @floatFromInt(direction.y)),
+    );
 
-    result[29] = quantizeZeroOne(
+    result[hunger_input] = quantizeZeroOne(
         @as(f32, @floatFromInt(game.steps_since_food)) /
             @as(f32, @floatFromInt(game.starvationBudget())),
     );
-    result[30] = quantizeZeroOne(
+    result[length_input] = quantizeZeroOne(
         @as(f32, @floatFromInt(game.length)) /
             @as(f32, @floatFromInt(board_cells)),
     );
 
     // Explicit affine offset instead of BitLinear bias.
-    result[31] = 127;
+    result[constant_input] = 127;
 
     return result;
 }
@@ -1495,7 +1484,6 @@ fn senseRay(game: *const SnakeGame, delta: Pos) RaySense {
     var pos = game.head();
     var distance: usize = 0;
     var body_proximity: f32 = 0.0;
-    var food_visibility: f32 = 0.0;
 
     while (true) {
         distance += 1;
@@ -1508,22 +1496,13 @@ fn senseRay(game: *const SnakeGame, delta: Pos) RaySense {
             return .{
                 .wall_proximity = inv_distance,
                 .body_proximity = body_proximity,
-                .food_visibility = food_visibility,
             };
-        }
-
-        if (food_visibility == 0.0 and Pos.eql(pos, game.food)) {
-            food_visibility = inv_distance;
         }
 
         if (body_proximity == 0.0 and game.contains(pos)) {
             body_proximity = inv_distance;
         }
     }
-}
-
-fn quantizeBool(value: bool) i8 {
-    return if (value) 127 else -127;
 }
 
 fn quantizeUnit(value: f32) i8 {
@@ -1536,6 +1515,50 @@ fn quantizeZeroOne(value: f32) i8 {
     const x = std.math.clamp(value, 0.0, 1.0);
     const q: i32 = @intFromFloat(@round(x * 127.0));
     return @intCast(std.math.clamp(q, 0, 127));
+}
+
+test "makeInput keeps obstacle rays in world frame" {
+    var game = SnakeGame.init(0x1234_5678_9abc_def0);
+    game.length = 3;
+    game.snake[0] = .{ .x = 10, .y = 8 };
+    game.snake[1] = .{ .x = 9, .y = 8 };
+    game.snake[2] = .{ .x = 8, .y = 8 };
+    game.food = .{ .x = 20, .y = 10 };
+    game.direction = .righ;
+    game.steps_since_food = 0;
+
+    const facing_right = makeInput(&game);
+
+    game.direction = .up;
+    const facing_up = makeInput(&game);
+
+    try std.testing.expectEqualSlices(
+        i8,
+        facing_right[0..ray_input_count],
+        facing_up[0..ray_input_count],
+    );
+    try std.testing.expectEqual(@as(i8, 127), facing_right[direction_x_input]);
+    try std.testing.expectEqual(@as(i8, 0), facing_right[direction_y_input]);
+    try std.testing.expectEqual(@as(i8, 0), facing_up[direction_x_input]);
+    try std.testing.expectEqual(@as(i8, -127), facing_up[direction_y_input]);
+
+    try std.testing.expectEqual(
+        quantizeZeroOne(10.0 / @as(f32, board_width - 1)),
+        facing_right[head_x_input],
+    );
+    try std.testing.expectEqual(
+        quantizeZeroOne(8.0 / @as(f32, board_height - 1)),
+        facing_right[head_y_input],
+    );
+    try std.testing.expectEqual(
+        quantizeZeroOne(20.0 / @as(f32, board_width - 1)),
+        facing_right[food_x_input],
+    );
+    try std.testing.expectEqual(
+        quantizeZeroOne(10.0 / @as(f32, board_height - 1)),
+        facing_right[food_y_input],
+    );
+    try std.testing.expectEqual(@as(i8, 127), facing_right[constant_input]);
 }
 
 fn chooseAction(output: []const i8) RelativeAction {
@@ -1565,13 +1588,6 @@ fn realOutput(value: i8, out_gain: f32) f32 {
 // ============================================================================
 // WORLD HELPERS
 // ============================================================================
-
-fn addPos(a: Pos, b: Pos) Pos {
-    return .{
-        .x = a.x + b.x,
-        .y = a.y + b.y,
-    };
-}
 
 fn insideBoard(pos: Pos) bool {
     return pos.x >= 0 and
@@ -1677,7 +1693,6 @@ fn copyGenome(
     dst.fitness = 0;
     @memset(dst.out, 0);
 }
-
 
 // ============================================================================
 // CHECKPOINT SAVE / LOAD
@@ -2292,7 +2307,7 @@ fn render(
     frame.write(
         panel_x,
         25,
-        "INPUT",
+        "INPUT (WORLD FRAME)",
         COLOR_CYAN,
     );
 
@@ -2300,24 +2315,34 @@ fn render(
         panel_x,
         27,
         COLOR_WHITE,
-        "danger S/L/R {d:>4} {d:>4} {d:>4}",
-        .{ input[0], input[1], input[2] },
+        "ray N wall/body {d:>4} {d:>4}",
+        .{ input[0], input[1] },
     );
 
     frame.writeFmt(
         panel_x,
         28,
         COLOR_WHITE,
-        "food local F/R {d:>4} {d:>4}",
-        .{ input[27], input[28] },
+        "head x/y {d:>4} {d:>4}  food x/y {d:>4} {d:>4}",
+        .{
+            input[head_x_input],
+            input[head_y_input],
+            input[food_x_input],
+            input[food_y_input],
+        },
     );
 
     frame.writeFmt(
         panel_x,
         29,
         COLOR_WHITE,
-        "hunger/length  {d:>4} {d:>4}",
-        .{ input[29], input[30] },
+        "dir x/y {d:>4} {d:>4}  hunger/len {d:>4} {d:>4}",
+        .{
+            input[direction_x_input],
+            input[direction_y_input],
+            input[hunger_input],
+            input[length_input],
+        },
     );
 
     frame.write(
@@ -2687,7 +2712,7 @@ fn printFinalReport(sim: *const Simulation) void {
     );
 
     std.debug.print(
-        "input_gain={d:.8} | 8-ray sensors | leakyReLU8 | explicit constant | no bias\n",
+        "input_gain={d:.8} | 8 absolute wall/body rays | raw position + heading | leakyReLU8 | no bias\n",
         .{input_gain},
     );
 

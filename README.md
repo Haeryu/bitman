@@ -1,4 +1,5 @@
 # bitman
+> A ternary neural network (-1, 0, 1) evolved with a genetic algorithm to play Snake.
 
 The network uses ternary weights (`-1, 0, 1`) inspired by [BitLinear](https://github.com/schneiderkamplab/bitlinear).
 
