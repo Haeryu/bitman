@@ -58,3 +58,21 @@ The replay view supports:
 - `[` / `]`: decrease/increase playback speed
 - `Q`: return to training, or quit standalone replay
 - `Esc`: save the resume checkpoint and quit training; quit standalone replay
+
+## Results
+
+Saved champions were evaluated on the same 1,000 fixed seeds. A baseline of 100 randomly initialized ternary networks was evaluated on the same seeds.
+
+| Model                   | Avg. food / episode | Best food |
+| ----------------------- | ------------------: | --------: |
+| Random ternary baseline |               0.028 |         2 |
+| Generation 50           |               0.335 |         4 |
+| Generation 500          |               6.471 |        21 |
+| Generation 1000         |              12.209 |        24 |
+| Generation 1500         |              14.116 |        24 |
+| Generation 2000         |              24.199 |        49 |
+| Generation 2400         |          **30.190** |        48 |
+
+Performance is noisy across generations, as expected from evolutionary search, but the overall trend shows a substantial improvement over randomly initialized ternary networks.
+
+The networks are evolved directly with genetic search; training uses no backpropagation or full-precision shadow weights.
